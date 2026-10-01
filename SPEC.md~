@@ -1,0 +1,398 @@
+# Doer — AI Goal-Scheduling Calendar App
+
+**Spec version:** 1.0 · **Date:** 2026-09-26 · **Status:** Approved architecture, pre-implementation
+
+A mobile app for ambitious people with big goals. Users describe their goals, attach context documents, and import their existing calendars. An LLM decomposes goals into atomic, duration-bounded tasks and assigns each to a day. A deterministic on-device engine places tasks into free time, writes them to a dedicated device calendar, and re-plans on request when the user falls behind.
+
+---
+
+## 1. Architecture Overview
+
+**Zero backend.** The Flutter client calls the LLM provider directly over HTTPS. No GPU host, no proxy, no API server, no database server. All state lives in on-device SQLite; all arithmetic is deterministic Dart.
+
+```mermaid
+flowchart LR
+    subgraph Client["Flutter client (Android)"]
+        UI["Agenda UI"] <--> DB[("SQLite\nsource of truth")]
+        Slotter["Dart slotter"] <--> DB
+        Slotter --> Cal["device_calendar\n"My Plan" calendar"]
+        UI --> Slotter
+        Extract["Text extraction\n(TXT/PDF/DOCX)"] --> LLM["Provider adapter\n+ JSON schema validation"]
+        ICSIn[".ics import\n(busy blocks)"] --> DB
+        Slotter --> LLM
+    end
+    LLM -->|"HTTPS + response_format"| P{"Provider"}
+    P -->|"demo key\n(capped, cheap model)"| Hosted["Hosted provider"]
+    P -->|"user key"| Byok["OpenAI / Anthropic / Gemini /\nOpenRouter / custom base URL\n(self-hosted vLLM)"]
+```
+
+### 1.1 Invariants
+
+1. **LLM does semantics only.** It decomposes goals into tasks and judges *which day* a task belongs on. It never computes times, durations-of-fit, feasibility, or interval math. `scheduled_start`/`scheduled_end` are slotter-owned.
+2. **Completion is monotonic.** A `completed` task is frozen forever; re-planning touches only unfinished work.
+3. **SQLite is the source of truth.** The device calendar is a projection; every written event id (`device_event_id`) maps back to a task row.
+4. **The app writes exactly one calendar** — `"My Plan"` — and never reads beyond busy-block ingestion or writes anything outside it.
+5. **All provider output is schema-validated** with at most one automatic repair retry, then fail-fast.
+6. **Local-first.** Everything except decomposition and full re-plan works offline.
+7. **Priorities are explicit user decisions** (P1–P3), never AI triage.
+
+---
+
+## 2. Platform & Stack
+
+| Concern | Choice |
+|---|---|
+| Client | Flutter (Dart), **Android-only** in v1 |
+| State/DB | `sqflite` (SQLite), local, source of truth |
+| Calendar I/O | `device_calendar` (Android Calendar Provider API) |
+| Secret storage | `flutter_secure_storage` (Android Keystore) |
+| File ingestion | `file_picker` + PDF/DOCX/TXT text extraction (client-side) |
+| LLM access | Direct HTTPS to provider; structured output via JSON schema (`response_format`) |
+| Default provider | Embedded **demo key** (single cheap structured-output model, hard-capped) |
+| BYOK | User-selectable presets + custom base URL (covers self-hosted vLLM/SGLang) |
+
+
+---
+
+## 3. Data Model (SQLite)
+
+```sql
+CREATE TABLE goals (
+  id              TEXT PRIMARY KEY,          -- client UUID
+  parent_goal_id  TEXT REFERENCES goals(id), -- optional long-term goal grouping; NULL = short-term
+  title           TEXT NOT NULL,
+  description     TEXT NOT NULL DEFAULT '',
+  priority        TEXT NOT NULL CHECK (priority IN ('P1','P2','P3')),
+  target_date     TEXT NOT NULL,             -- ISO 8601 date, goal-level deadline
+  status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+  created_at      TEXT NOT NULL
+);
+
+CREATE TABLE tasks (
+  id               TEXT PRIMARY KEY,         -- client UUID (remapped from LLM task_id)
+  goal_id          TEXT NOT NULL REFERENCES goals(id),
+  title            TEXT NOT NULL,
+  duration_minutes INTEGER NOT NULL,
+  recommended_day  TEXT,                      -- LLM-assigned ISO date (input to slotter)
+  pinned_deadline  TEXT,                      -- optional user-pinned latest acceptable day
+  prerequisite_ids TEXT NOT NULL DEFAULT '[]', -- JSON array of task UUIDs
+  scheduled_start  TEXT,                      -- ISO 8601 local datetime; slotter-owned
+  scheduled_end    TEXT,
+  status           TEXT NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending','completed','skipped')),
+  adjusted         INTEGER NOT NULL DEFAULT 0, -- slotter moved day or compressed duration
+  skip_count       INTEGER NOT NULL DEFAULT 0,
+  device_event_id  TEXT,                     -- event in "My Plan" calendar
+  created_at       TEXT NOT NULL
+);
+
+CREATE TABLE documents (
+  id             TEXT PRIMARY KEY,
+  goal_id        TEXT NOT NULL REFERENCES goals(id),
+  filename       TEXT NOT NULL,
+  extracted_text TEXT NOT NULL               -- stored once; re-decompose reuses it
+);
+
+CREATE TABLE busy_blocks (
+  id     TEXT PRIMARY KEY,
+  source TEXT NOT NULL,                     -- imported file name
+  start  TEXT NOT NULL,                     -- ISO 8601 local datetime
+  end    TEXT NOT NULL
+);
+
+CREATE TABLE user_preferences (
+  id             INTEGER PRIMARY KEY CHECK (id = 1),   -- singleton row
+  work_start     TEXT NOT NULL,             -- 'HH:mm' local
+  work_end       TEXT NOT NULL,
+  buffer_minutes INTEGER NOT NULL DEFAULT 10,
+  active_days    TEXT NOT NULL DEFAULT '["mon","tue","wed","thu","fri"]',
+  timezone       TEXT NOT NULL,             -- IANA zone captured at setup
+  plan_calendar_id TEXT                    -- device_calendar id of "My Plan"
+);
+
+CREATE TABLE provider_config (
+  id        INTEGER PRIMARY KEY CHECK (id = 1),
+  mode      TEXT NOT NULL DEFAULT 'demo' CHECK (mode IN ('demo','byok')),
+  preset    TEXT,                           -- 'openai'|'anthropic'|'gemini'|'openrouter'|'custom'
+  base_url  TEXT,                           -- required when preset = 'custom'
+  model     TEXT
+  -- API key is NOT stored here; it lives in flutter_secure_storage, keyed by preset.
+);
+```
+
+**Notes**
+- Free-form goal intake (no forced scaffold). Long-term goals are optional grouping rows; decomposition operates only on goals with a `target_date`.
+- `documents.extracted_text` persists so regeneration never re-parses files.
+- Busy blocks are read-path only: inputs to the slotter, never modified by it.
+
+---
+
+## 4. LLM Integration
+
+### 4.1 Provider abstraction
+
+One Dart interface; presets are thin adapters over it:
+
+```dart
+abstract class LlmProvider {
+  /// Sends prompt + JSON schema via the provider's structured-output mode.
+  /// Returns raw JSON. Throws typed errors: AuthError, RateLimitError,
+  /// QuotaError, NetworkError, ProviderError.
+  Future<Map<String, dynamic>> complete({
+    required String system, required String user,
+    required Map<String, dynamic> jsonSchema,
+  });
+}
+```
+
+- Presets: OpenAI, Anthropic, Gemini, OpenRouter, Custom (OpenAI-compatible base URL → any self-hosted vLLM/SGLang endpoint).
+- **Demo mode** (default): embedded key, fixed cheap structured-output model, no user config.
+- **BYOK mode**: settings screen — provider preset, base URL (custom), model name, API key. Key validated inline with a cheap test call at save time.
+
+### 4.2 Decomposition (initial pass, per goal batch)
+
+**Request context** (all client-computed):
+- Today's date, horizon window `[today, today+7)` (rolling, 7 days default).
+- **Per-day summary** — compact, never raw intervals: `{date, weekday, busy_hours, remaining_free_hours}` for each active day.
+- Goals: title, description, priority, target_date, extracted document text (truncated to a fixed character budget per doc).
+- A pending-tasks digest (titles + assigned days) when decomposing an additional goal into an already-scheduled week, so load balances.
+
+**Response schema** (enforced via `response_format`; the exact object the slotter consumes):
+
+```json
+{
+  "type": "object",
+  "required": ["tasks"],
+  "properties": {
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["task_id","goal_id","title","duration_minutes","recommended_day","prerequisite_ids"],
+        "properties": {
+          "task_id":          { "type": "string" },
+          "goal_id":          { "type": "string" },
+          "title":            { "type": "string", "maxLength": 120 },
+          "duration_minutes": { "type": "integer", "minimum": 5, "maximum": 480 },
+          "recommended_day":  { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "prerequisite_ids": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}
+```
+
+LLM responsibilities end here: task list, durations, dependency graph, **day assignment** (semantic pacing — spread sessions instead of cramming, respect goal target dates, balance load across goals by priority).
+
+### 4.3 Re-plan (explicit user request)
+
+Same per-day summary format plus: all unfinished tasks (title, duration, `skip_count`, current day), pinned deadlines, and a compact completed-work digest (informs coaching tips).
+
+**Response schema** (re-dates **every** unfinished task; task objects are identical to §4.2 — including `recommended_day`, the field that carries the re-dating. Completed tasks are never re-sent as mutable, they appear only in the digest. `task_id` values echo the client's existing task UUIDs so the client can re-join `pinned_deadline` from SQLite by id — the LLM never echoes client-owned state):
+
+```json
+{
+  "type": "object",
+  "required": ["tasks"],
+  "properties": {
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["task_id","goal_id","title","duration_minutes","recommended_day","prerequisite_ids"],
+        "properties": {
+          "task_id":          { "type": "string" },
+          "goal_id":          { "type": "string" },
+          "title":            { "type": "string", "maxLength": 120 },
+          "duration_minutes": { "type": "integer", "minimum": 5, "maximum": 480 },
+          "recommended_day":  { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "prerequisite_ids": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "tips": { "type": "array", "items": { "type": "string" }, "maxItems": 3 }
+  }
+}
+```
+
+Tips are shown with the re-plan result; they never mutate state. The slotter consumes this schema identically to §4.2 output (same guards: horizon clamp, dependency day-push, spill-forward compression).
+
+### 4.4 Validation & error policy
+
+1. **Schema validation on-device** immediately after receipt (JSON schema + additional semantic checks below).
+2. **One automatic repair retry**: re-prompt once with the validation errors appended; second failure → fail-fast with an inline error. No other automatic retries.
+3. Fail-fast mapping: `401/403` → "Key invalid or revoked"; `402/429` → "Quota/rate limited"; `5xx`/network → "Provider unavailable". Each surfaces inline in the screen that triggered it. BYOK users see their own errors verbatim.
+4. **Demo-key degradation:** quota/payment/revocation errors in demo mode raise a banner — *"Demo budget exhausted — add your own provider in Settings"* — deep-linking to provider settings. Blocked: decompose + re-plan. Still fully functional: agenda, task status, skip re-slot, calendar writes, imports, goal CRUD.
+
+**Slotter-side semantic validation** (treated identically → repair retry → fail-fast): `recommended_day` outside horizon or unparseable; unknown `goal_id`; `prerequisite_ids` referencing unknown/self/cyclic ids (cyclic → drop back-edge, flag).
+
+---
+
+## 5. Slotter Engine (Dart, deterministic)
+
+### 5.1 Inputs
+Unplaced tasks; occupied time = `busy_blocks` ∪ already-placed tasks (all statuses — completed slots are history and stay occupied); `user_preferences`.
+
+### 5.2 Free-segment construction
+For each active day in the rolling horizon `[today, today+7)`:
+`free_segments(day) = work window − occupied intervals − buffer padding` (`buffer_minutes` applied around each occupied edge).
+
+### 5.3 Placement algorithm
+1. **Order:** topological sort by prerequisites (prereqs first), stable within by goal priority (P1 → P3), then `recommended_day`, then creation order.
+2. **Per task:** `latest_day = pinned_deadline ?? goal.target_date ?? horizon_end`; `day = clamp(recommended_day, today, latest_day)`.
+3. **Day search:** first day from `day` to `latest_day` with a free segment ≥ `duration_minutes` → earliest such segment in that day. None fits full duration → place in the **largest remaining segment through `latest_day`**, shortening the duration to fit (floor: 15 min); flag `adjusted`. Nothing ≥ floor → leave unscheduled, surface in UI as needs-attention.
+4. **Dependency guard:** a dependent task's earliest allowed day = `max(placed day of prerequisites)`. Enforced during processing (prereqs are placed first); violations are impossible rather than repaired.
+5. **Adjust flag:** set whenever placed day ≠ `recommended_day` or duration was compressed. UI renders an "adjusted" marker.
+6. Persist `scheduled_start/end`; update occupied set as tasks are placed.
+
+### 5.4 Skip re-slot ("Didn't Start" tap) — local, no LLM
+Mark task `skipped`, `skip_count++`; re-place with earliest allowed day = `max(today, original day)`; compress per §5.3 if needed; shift dependent unfinished tasks whose day constraints break; delete + rewrite affected device events only. Runs in milliseconds, offline.
+
+### 5.5 Full re-plan — LLM pass + atomic rewrite
+1. Send re-plan request (§4.3).
+2. Slotter places the returned unfinished set (same guards; completed tasks frozen and untouched).
+3. **Atomic calendar rewrite:** delete device events for all unfinished tasks (by `device_event_id`), keep completed events, write new placements. SQLite is committed first; calendar write failures surface as retryable inline errors without corrupting local state.
+4. Display returned `tips` with the result.
+
+**Rolling horizon:** decomposition sizes the task set to the current 7-day window. Goals with later target dates receive partial plans; an explicit re-plan rolls the window forward. No unbounded future generation.
+
+---
+
+## 6. Calendar Integration (Android Calendar Provider)
+
+- **`"My Plan"` calendar** is created on first plan write (find-or-create by name; id stored in `user_preferences.plan_calendar_id`). Requires `READ_CALENDAR`/`WRITE_CALENDAR` runtime permissions.
+- Event = task title, `scheduled_start` → `scheduled_end` (local device timezone), calendar = `"My Plan"`. Store returned `device_event_id` on the task row.
+- **No `.ics` file exports.** Static file imports duplicate events and cannot replace prior exports — the write path is programmatic and atomic per §5.5.
+- Reminders come free: the device calendar app's native alarms fire for `"My Plan"` events. The app implements no notification system of its own.
+- Upstream Google sync happens automatically if the account is linked; the app neither knows nor cares.
+- `.ics` remains **read-path only** (§7.2).
+
+---
+
+## 7. Ingestion (all client-side)
+
+### 7.1 Documents → `documents.extracted_text`
+`file_picker` → TXT (UTF-8), PDF (text layer extraction), DOCX (XML text extraction). Extracted text truncated to a fixed per-document character budget before storage/prompting. Unsupported/failed extraction → inline error, goal remains usable without the doc.
+
+### 7.2 Existing calendars → `busy_blocks`
+`file_picker` → parse `VEVENT`s: `DTSTART`/`DTEND` (or `DURATION`), `TZID`/UTC normalization to local device time, `RRULE` expansion across the horizon. All-day events (DATE values) mark the full working window of that day busy. Expanded intervals stored with source filename. Busy blocks are inputs only — the slotter never overlaps them, never edits them.
+
+---
+
+## 8. UI / UX
+
+**Onboarding:** opens directly to the agenda on the demo key. No gate, no wizard. Empty-state prompts guide to the first goal.
+
+### 8.1 Screens
+1. **Agenda (home)** — today's tasks grouped by goal, ordered by time; per-task quick actions **Done** / **Didn't Start**; "Re-plan" button; adjusted/needs-attention markers; provider-error banner area; offline badge when applicable.
+2. **Goals** — list with priority chips, target dates, progress (completed/total); create/edit: title, description, priority (P1–P3), target date, document attach; "Decompose" action per goal.
+3. **Settings** — provider config (demo status, BYOK preset/base URL/model/key, inline validation), working hours, buffer minutes, active days, `.ics` import, demo-key exhaustion messaging entry point.
+4. **Re-plan result** — new plan summary, moved-task diff, coaching tips.
+
+### 8.2 Degradation matrix
+
+| Capability | Needs provider? |
+|---|---|
+| Agenda view, task status (Done/Didn't Start) | No |
+| Skip re-slot + calendar rewrite | No |
+| `.ics` import, document extraction | No |
+| Goal CRUD | No |
+| Decompose (new goal) | Yes |
+| Full re-plan | Yes |
+
+---
+
+## 9. Security & Demo-Key Operations
+
+- **The embedded demo key will be extracted.** Treat it as public from day one. Controls: hard monthly spend cap set on the provider dashboard at an amount acceptable to lose entirely; restricted to a single cheap structured-output model; assume strangers will drain it and the §4.4 degradation path is the designed response.
+- **Rotation:** key rotation requires either an app release (key compiled in) or a static remote config file (demo mode reads preset/model/key from a versioned static URL — no compute backend, enables rotation without a release). Build-time choice; static remote config recommended.
+- BYOK keys live in `flutter_secure_storage` (Keystore-backed), never in SQLite, never logged.
+- No telemetry. The only network traffic is provider HTTPS.
+
+---
+
+## 10. Performance Targets
+
+- Slotter full re-place of ≤ 100 tasks: < 100 ms on mid-range Android.
+- Decompose/re-plan latency: provider-bound (typically 5–30 s); progress indicator, cancellable.
+- All local operations instant and offline-capable.
+
+---
+
+## 11. Non-Goals (v1)
+
+- iOS release (Flutter Android-first in v1; cross-platform port deferred)
+- Push/background notifications (device calendar provides alarms)
+- WebCal/subscription URLs; any server or proxy
+- AI priority triage or fair-share scheduling (explicit user priorities only)
+- Clarifying-question intake flow ("AI asks questions" — future work)
+- VTODO components; `.ics` export
+- Multi-device sync / accounts
+
+---
+
+## 12. Verification & Acceptance Criteria
+
+**Unit (slotter):** free-segment math with fixture busy blocks (work windows, buffers, overlap, RRULE expansions, TZID/UTC); priority ordering; dependency day-push; spill-forward + compression + adjust flagging; pinned-deadline clamping.
+
+**Unit (providers):** adapter contract against a mock server; schema-repair retry fires exactly once; error mapping (401/402/429/5xx); demo-mode banner on quota errors.
+
+**Unit (.ics parser):** fixture files covering recurring events, zoned and UTC times, all-day events.
+
+**Integration (device/emulator):** `"My Plan"` creation; event write; atomic re-plan rewrite deletes unfinished events and preserves completed ones; skip re-slot moves exactly the affected events.
+
+**End-to-end acceptance:**
+1. Fresh install → agenda opens on demo key, no gate.
+2. Create P1 goal with target date + PDF → decompose → tasks slotted across days within working hours, busy-imported time respected.
+3. Import personal `.ics` → next decompose/re-plan avoids busy blocks.
+4. Mark task Done → frozen forever; calendar event remains.
+5. Tap Didn't Start on another → instantly re-slotted locally (offline), device calendar event moves, "adjusted" marker shown.
+6. Request re-plan → LLM re-dates unfinished tasks; `"My Plan"` atomically rewritten; completed events untouched; tips displayed.
+7. Simulate demo-key 402 → banner appears, deep-links to settings; all local features keep working.
+
+---
+
+## 13. Goal Intake Notes
+
+Free-form multi-goal intake (no forced scaffolding): each goal is a short-term target with title, free-text description, explicit priority, and a target date; optional long-term grouping via `parent_goal_id`. Document attachments supply domain context. The prompt's per-day summary plus goal priorities is what makes decomposition quality survive the unstructured intake.
+
+---
+
+## 14. Decision Log
+
+| # | Decision | Choice | Round |
+|---|---|---|---|
+| 1 | AI runtime | Hosted API with structured JSON output | R1→R6 |
+| 2 | Product surface | App hosts plan; device calendar as projection | R1 |
+| 3 | Profile | Persistent, client-side (SQLite) | R1→R5 |
+| 4 | Horizon | Rolling 7-day, tasks into free time, re-plan remainder | R1 |
+| 5 | Correct output | JSON-schema structured output + validate-and-repair | R2→R6 |
+| 6 | Missed task | Re-slot nearest feasible day, compress if stale, remainder shifts | R2, R9 |
+| 7 | Goals | Multiple parallel goals, free-form intake, explicit P1–P3 | R2 |
+| 8 | Task structure | Goal-level target date; durations + dependencies; per-task deadline only if user pins | R2 |
+| 9 | Completion | Monotonic — done is frozen | R2 |
+| 10 | Scheduling split | Hybrid: LLM decompose+day-assign; deterministic Dart slotter places times | R3, R9 |
+| 11 | Priorities | User-assigned weights; no AI triage | R3 |
+| 12 | UI surface | Daily agenda list, not calendar grid | R3 |
+| 13 | Platform | Android-only v1 | R3→R5 |
+| 14 | Client stack | Flutter (Dart) | R5 |
+| 15 | Extraction | Client-side text extraction | R5 |
+| 16 | Provider topology | Direct client→provider; zero backend | R6 |
+| 17 | Keys | Embedded capped demo key default + BYOK w/ custom base URL | R6 |
+| 18 | Errors | Fail-fast inline; exactly one schema-repair retry | R6 |
+| 19 | Onboarding | Agenda-first, no gate | R6 |
+| 20 | Demo exhaustion | Graceful degradation banner → settings deep-link; app otherwise functional | R7 |
+| 21 | Calendar write | device_calendar programmatic "My Plan"; atomic rewrite; no .ics export | R8 |
+| 22 | Day authority | LLM assigns `recommended_day` from per-day summaries; slotter owns times + feasibility | R9 |
+| 23 | Re-plan split | Skipped task → local slotter; full re-plan → LLM pass on user request | R9 |
+
+---
+
+## 15. Future Work
+
+- iOS release (Flutter port + permission parity)
+- AI clarifying-question intake pass
+- Richer coaching (streak detection, habit-level tips) built on completion history
+- Auto-refresh of the rolling horizon (scheduled, opt-in)
+- Home-screen agenda widget
