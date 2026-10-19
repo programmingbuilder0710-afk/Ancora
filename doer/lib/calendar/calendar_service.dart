@@ -1,19 +1,23 @@
 import 'dart:async';
+
+import 'plan_calendar.dart';
+
 import 'package:device_calendar/device_calendar.dart';
 import 'package:flutter/material.dart' show Color;
 import 'package:timezone/data/latest_all.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
+
 import '../models/models.dart';
 import '../slotter/slotter.dart';
 
-class CalendarService {
+class CalendarService implements PlanCalendar {
   final DeviceCalendarPlugin _deviceCalendarPlugin = DeviceCalendarPlugin();
   final String _calendarName = 'My Plan';
   String? _planCalendarId;
 
   CalendarService(this._planCalendarId, {this.preferences})
-      : _resolvedTimezone = preferences?.timezone == null ||
-              preferences!.timezone.isEmpty
+    : _resolvedTimezone =
+          preferences?.timezone == null || preferences!.timezone.isEmpty
           ? 'UTC'
           : preferences.timezone {
     tzdata.initializeTimeZones();
@@ -21,7 +25,8 @@ class CalendarService {
       _location = tz.getLocation(_resolvedTimezone);
       tz.setLocalLocation(_location);
     } on LocationNotFoundException catch (e) {
-      _timezoneWarning = 'Invalid timezone "$_resolvedTimezone" from '
+      _timezoneWarning =
+          'Invalid timezone "$_resolvedTimezone" from '
           'UserPreferences.timezone; falling back to UTC. ($e)';
       _resolvedTimezone = 'UTC';
       _location = tz.getLocation('UTC');
@@ -47,7 +52,9 @@ class CalendarService {
 
     final calendarsResult = await _deviceCalendarPlugin.retrieveCalendars();
     if (!calendarsResult.isSuccess || calendarsResult.data == null) {
-      throw Exception('Failed to retrieve calendars: ${calendarsResult.errors}');
+      throw Exception(
+        'Failed to retrieve calendars: ${calendarsResult.errors}',
+      );
     }
 
     for (final calendar in calendarsResult.data!) {
@@ -77,6 +84,7 @@ class CalendarService {
     return id;
   }
 
+  @override
   Future<String> writeTaskEvent(Task task) async {
     if (task.scheduledStart == null || task.scheduledEnd == null) {
       throw Exception('Task has no scheduled time');
@@ -101,13 +109,18 @@ class CalendarService {
     return eventId;
   }
 
+  @override
   Future<void> deleteEvent(String deviceEventId) async {
-    final result = await _deviceCalendarPlugin.deleteEvent(planCalendarId, deviceEventId);
+    final result = await _deviceCalendarPlugin.deleteEvent(
+      planCalendarId,
+      deviceEventId,
+    );
     if (!result.isSuccess) {
       throw Exception('Failed to delete event: ${result.errors}');
     }
   }
 
+  @override
   Future<Map<String, String>> atomicRewrite(
     List<PlacementResult> placementResults,
     Map<String, String> existingDeviceIds,

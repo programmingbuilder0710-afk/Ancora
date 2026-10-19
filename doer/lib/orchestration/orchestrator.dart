@@ -1,13 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:collection/collection.dart';
 import 'package:uuid/uuid.dart';
+
 import '../models/models.dart';
 import '../data/database_helper.dart';
 import '../provider/provider.dart';
 import '../slotter/slotter.dart';
-import '../calendar/calendar_service.dart';
+import '../calendar/plan_calendar.dart';
 import '../extraction/extraction.dart';
 
 /// Orchestrates the full pipeline: LLM decomposition → slotter → SQLite → calendar.
@@ -15,7 +17,7 @@ class Orchestrator {
   final DatabaseHelper db;
   final LlmProvider Function() providerFactory;
   final Slotter slotter;
-  final CalendarService? calendar;
+  final PlanCalendar? calendar;
 
   Orchestrator({
     required this.db,
@@ -34,14 +36,31 @@ class Orchestrator {
         'type': 'array',
         'items': {
           'type': 'object',
-          'required': ['task_id','goal_id','title','duration_minutes','recommended_day','prerequisite_ids'],
+          'required': [
+            'task_id',
+            'goal_id',
+            'title',
+            'duration_minutes',
+            'recommended_day',
+            'prerequisite_ids',
+          ],
           'properties': {
-            'task_id':          {'type': 'string'},
-            'goal_id':          {'type': 'string'},
-            'title':            {'type': 'string', 'maxLength': 120},
-            'duration_minutes': {'type': 'integer', 'minimum': 5, 'maximum': 480},
-            'recommended_day':  {'type': 'string', 'pattern': r'^\d{4}-\d{2}-\d{2}$'},
-            'prerequisite_ids': {'type': 'array', 'items': {'type': 'string'}},
+            'task_id': {'type': 'string'},
+            'goal_id': {'type': 'string'},
+            'title': {'type': 'string', 'maxLength': 120},
+            'duration_minutes': {
+              'type': 'integer',
+              'minimum': 5,
+              'maximum': 480,
+            },
+            'recommended_day': {
+              'type': 'string',
+              'pattern': r'^\d{4}-\d{2}-\d{2}$',
+            },
+            'prerequisite_ids': {
+              'type': 'array',
+              'items': {'type': 'string'},
+            },
           },
         },
       },
@@ -56,18 +75,39 @@ class Orchestrator {
         'type': 'array',
         'items': {
           'type': 'object',
-          'required': ['task_id','goal_id','title','duration_minutes','recommended_day','prerequisite_ids'],
+          'required': [
+            'task_id',
+            'goal_id',
+            'title',
+            'duration_minutes',
+            'recommended_day',
+            'prerequisite_ids',
+          ],
           'properties': {
-            'task_id':          {'type': 'string'},
-            'goal_id':          {'type': 'string'},
-            'title':            {'type': 'string', 'maxLength': 120},
-            'duration_minutes': {'type': 'integer', 'minimum': 5, 'maximum': 480},
-            'recommended_day':  {'type': 'string', 'pattern': r'^\d{4}-\d{2}-\d{2}$'},
-            'prerequisite_ids': {'type': 'array', 'items': {'type': 'string'}},
+            'task_id': {'type': 'string'},
+            'goal_id': {'type': 'string'},
+            'title': {'type': 'string', 'maxLength': 120},
+            'duration_minutes': {
+              'type': 'integer',
+              'minimum': 5,
+              'maximum': 480,
+            },
+            'recommended_day': {
+              'type': 'string',
+              'pattern': r'^\d{4}-\d{2}-\d{2}$',
+            },
+            'prerequisite_ids': {
+              'type': 'array',
+              'items': {'type': 'string'},
+            },
           },
         },
       },
-      'tips': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 3},
+      'tips': {
+        'type': 'array',
+        'items': {'type': 'string'},
+        'maxItems': 3,
+      },
     },
   };
 
@@ -80,7 +120,11 @@ class Orchestrator {
     final summary = <Map<String, dynamic>>[];
 
     for (int i = 0; i < horizonDays; i++) {
-      final day = DateTime(horizonStart.year, horizonStart.month, horizonStart.day).add(Duration(days: i));
+      final day = DateTime(
+        horizonStart.year,
+        horizonStart.month,
+        horizonStart.day,
+      ).add(Duration(days: i));
       final dayEnd = day.add(const Duration(days: 1));
 
       double busyMinutes = 0;
@@ -105,10 +149,13 @@ class Orchestrator {
 
       const weekdays = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
       summary.add({
-        'date': '${day.year}-${day.month.toString().padLeft(2, '0')}-${day.day.toString().padLeft(2, '0')}',
+        'date':
+            '${day.year}-${day.month.toString().padLeft(2, '0')}-${day.day.toString().padLeft(2, '0')}',
         'weekday': weekdays[day.weekday - 1],
         'busy_hours': double.parse((busyMinutes / 60).toStringAsFixed(1)),
-        'remaining_free_hours': double.parse(((placedMinutes) / 60).toStringAsFixed(1)),
+        'remaining_free_hours': double.parse(
+          ((placedMinutes) / 60).toStringAsFixed(1),
+        ),
       });
     }
 
@@ -116,25 +163,34 @@ class Orchestrator {
   }
 
   /// Initial decomposition: for a batch of goals.
-  Future<List<PlacementResult>> decompose({
-    required List<Goal> goals,
-  }) async {
+  Future<List<PlacementResult>> decompose({required List<Goal> goals}) async {
     if (goals.isEmpty) return [];
     final provider = providerFactory();
 
     final now = DateTime.now();
     final horizonStart = DateTime(now.year, now.month, now.day);
-    final busyBlocks = await db.getBusyBlocksInRange(horizonStart, horizonStart.add(Duration(days: horizonDays)));
+    final busyBlocks = await db.getBusyBlocksInRange(
+      horizonStart,
+      horizonStart.add(Duration(days: horizonDays)),
+    );
     final allTasks = await db.getAllTasks();
 
-    final perDaySummary = await _buildPerDaySummary(horizonStart, busyBlocks, allTasks);
-    final goalsContext = goals.map((g) => {
-      'goal_id': g.id,
-      'title': g.title,
-      'description': g.description,
-      'priority': g.priority.name,
-      'target_date': g.targetDate,
-    }).toList();
+    final perDaySummary = await _buildPerDaySummary(
+      horizonStart,
+      busyBlocks,
+      allTasks,
+    );
+    final goalsContext = goals
+        .map(
+          (g) => {
+            'goal_id': g.id,
+            'title': g.title,
+            'description': g.description,
+            'priority': g.priority.name,
+            'target_date': g.targetDate,
+          },
+        )
+        .toList();
 
     final docsContext = <Map<String, dynamic>>[];
     for (final goal in goals) {
@@ -149,15 +205,21 @@ class Orchestrator {
     }
 
     final pendingDigest = allTasks
-        .where((t) => t.status == TaskStatus.pending && t.scheduledStart != null)
-        .map((t) => {
-          'task_id': t.id,
-          'title': t.title,
-          'day': t.scheduledStart!.substring(0, 10),
-        }).toList();
+        .where(
+          (t) => t.status == TaskStatus.pending && t.scheduledStart != null,
+        )
+        .map(
+          (t) => {
+            'task_id': t.id,
+            'title': t.title,
+            'day': t.scheduledStart!.substring(0, 10),
+          },
+        )
+        .toList();
 
     final userContext = {
-      'today': '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}',
+      'today':
+          '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}',
       'horizon_days': horizonDays,
       'per_day_summary': perDaySummary,
       'goals': goalsContext,
@@ -187,7 +249,8 @@ Return only JSON matching the required schema.
       // Attempt 2: repair retry with errors appended
       response = await provider.complete(
         system: system,
-        user: '${jsonEncode(userContext)}\n\nPrevious attempt failed validation: ${e.message}. '
+        user:
+            '${jsonEncode(userContext)}\n\nPrevious attempt failed validation: ${e.message}. '
             'Fix the errors and return only JSON matching the schema.',
         jsonSchema: _decomposeSchema,
       );
@@ -206,7 +269,10 @@ Return only JSON matching the required schema.
     final slotterTasks = await db.getTasksByStatus(TaskStatus.pending);
     final placementResults = slotter.placeTasks(
       tasks: slotterTasks,
-      busyBlocks: busyBlocks,
+      busyBlocks: [
+        ...busyBlocks,
+        ..._scheduledOccupancy(allTasks, horizonStart),
+      ],
       horizonStart: horizonStart,
       horizonDays: horizonDays,
     );
@@ -224,14 +290,46 @@ Return only JSON matching the required schema.
       for (final t in allTasks) {
         if (t.deviceEventId != null) existingIds[t.id] = t.deviceEventId!;
       }
-      final newIds = await calendar!.atomicRewrite(placementResults, existingIds);
+      final newIds = await calendar!.atomicRewrite(
+        placementResults,
+        existingIds,
+      );
       for (final entry in newIds.entries) {
-        final task = placementResults.firstWhere((r) => r.task.id == entry.key).task;
+        final task = placementResults
+            .firstWhere((r) => r.task.id == entry.key)
+            .task;
         await db.updateTask(task.copyWith(deviceEventId: entry.value));
       }
     }
 
     return placementResults;
+  }
+
+  // Frozen scheduled slots remain occupied, even though only pending rows are
+  // sent to placement. These blocks are never persisted as calendar imports.
+  List<BusyBlock> _scheduledOccupancy(List<Task> tasks, DateTime horizonStart) {
+    final horizonEnd = horizonStart.add(Duration(days: horizonDays));
+    final blocks = <BusyBlock>[];
+    for (final task in tasks) {
+      if (task.status == TaskStatus.pending ||
+          task.scheduledStart == null ||
+          task.scheduledEnd == null) {
+        continue;
+      }
+      final start = DateTime.parse(task.scheduledStart!).toLocal();
+      final end = DateTime.parse(task.scheduledEnd!).toLocal();
+      if (start.isBefore(horizonEnd) && end.isAfter(horizonStart)) {
+        blocks.add(
+          BusyBlock(
+            id: 'task:${task.id}',
+            source: 'scheduled-task',
+            start: start,
+            end: end,
+          ),
+        );
+      }
+    }
+    return blocks;
   }
 
   /// Full re-plan: explicit user request. LLM re-dates all unfinished tasks.
@@ -240,12 +338,17 @@ Return only JSON matching the required schema.
 
     final now = DateTime.now();
     final horizonStart = DateTime(now.year, now.month, now.day);
-    final busyBlocks = await db.getBusyBlocksInRange(horizonStart, horizonStart.add(Duration(days: horizonDays)));
+    final busyBlocks = await db.getBusyBlocksInRange(
+      horizonStart,
+      horizonStart.add(Duration(days: horizonDays)),
+    );
     final allTasks = await db.getAllTasks();
     final allGoalsList = await db.getAllGoals(activeOnly: false);
     final goalsById = {for (final g in allGoalsList) g.id: g};
 
-    final unfinished = allTasks.where((t) => t.status != TaskStatus.completed).toList();
+    final unfinished = allTasks
+        .where((t) => t.status != TaskStatus.completed)
+        .toList();
     if (unfinished.isEmpty) {
       return ReplanResult(placementResults: [], tips: []);
     }
@@ -255,30 +358,42 @@ Return only JSON matching the required schema.
         .map((t) => {'title': t.title, 'goal_id': t.goalId})
         .toList();
 
-    final perDaySummary = await _buildPerDaySummary(horizonStart, busyBlocks, allTasks);
+    final perDaySummary = await _buildPerDaySummary(
+      horizonStart,
+      busyBlocks,
+      allTasks,
+    );
 
-    final tasksContext = unfinished.map((t) => {
-      'task_id': t.id,
-      'goal_id': t.goalId,
-      'title': t.title,
-      'duration_minutes': t.durationMinutes,
-      'skip_count': t.skipCount,
-      'current_day': t.scheduledStart?.substring(0, 10),
-      'pinned_deadline': t.pinnedDeadline,
-    }).toList();
+    final tasksContext = unfinished
+        .map(
+          (t) => {
+            'task_id': t.id,
+            'goal_id': t.goalId,
+            'title': t.title,
+            'duration_minutes': t.durationMinutes,
+            'skip_count': t.skipCount,
+            'current_day': t.scheduledStart?.substring(0, 10),
+            'pinned_deadline': t.pinnedDeadline,
+          },
+        )
+        .toList();
 
     final goalsContext = unfinished
         .map((t) => goalsById[t.goalId])
         .whereType<Goal>()
-        .map((g) => {
-          'goal_id': g.id,
-          'title': g.title,
-          'priority': g.priority.name,
-          'target_date': g.targetDate,
-        }).toList();
+        .map(
+          (g) => {
+            'goal_id': g.id,
+            'title': g.title,
+            'priority': g.priority.name,
+            'target_date': g.targetDate,
+          },
+        )
+        .toList();
 
     final userContext = {
-      'today': '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}',
+      'today':
+          '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}',
       'horizon_days': horizonDays,
       'per_day_summary': perDaySummary,
       'unfinished_tasks': tasksContext,
@@ -309,16 +424,20 @@ Return only JSON matching the required schema.
       // Attempt 2: repair retry
       response = await provider.complete(
         system: system,
-        user: '${jsonEncode(userContext)}\n\nPrevious attempt failed validation: ${e.message}. '
+        user:
+            '${jsonEncode(userContext)}\n\nPrevious attempt failed validation: ${e.message}. '
             'Fix the errors and return only JSON matching the schema.',
         jsonSchema: _replanSchema,
       );
     }
 
     // Re-join pinned deadlines by task_id (LLM never echoes client-owned state)
-    final tasks = _validateAndConvertTasks(response['tasks'] as List, allGoalsList,
-        pinnedDeadlines: {for (final t in unfinished) t.id: t.pinnedDeadline},
-        preserveIds: {for (final t in unfinished) t.id});
+    final tasks = _validateAndConvertTasks(
+      response['tasks'] as List,
+      allGoalsList,
+      pinnedDeadlines: {for (final t in unfinished) t.id: t.pinnedDeadline},
+      preserveIds: {for (final t in unfinished) t.id},
+    );
 
     if (tasks.isEmpty) {
       throw Exception('LLM returned no valid tasks');
@@ -354,7 +473,10 @@ Return only JSON matching the required schema.
     final slotterTasks = await db.getTasksByStatus(TaskStatus.pending);
     final placementResults = slotter.placeTasks(
       tasks: slotterTasks,
-      busyBlocks: busyBlocks,
+      busyBlocks: [
+        ...busyBlocks,
+        ..._scheduledOccupancy(allTasks, horizonStart),
+      ],
       horizonStart: horizonStart,
       horizonDays: horizonDays,
     );
@@ -372,14 +494,20 @@ Return only JSON matching the required schema.
       for (final t in unfinished) {
         if (t.deviceEventId != null) existingIds[t.id] = t.deviceEventId!;
       }
-      final newIds = await calendar!.atomicRewrite(placementResults, existingIds);
+      final newIds = await calendar!.atomicRewrite(
+        placementResults,
+        existingIds,
+      );
       for (final entry in newIds.entries) {
-        final result = placementResults.firstWhere((r) => r.task.id == entry.key);
+        final result = placementResults.firstWhere(
+          (r) => r.task.id == entry.key,
+        );
         await db.updateTask(result.task.copyWith(deviceEventId: entry.value));
       }
     }
 
-    final tips = (response['tips'] as List?)?.map((e) => e.toString()).toList() ?? [];
+    final tips =
+        (response['tips'] as List?)?.map((e) => e.toString()).toList() ?? [];
     return ReplanResult(placementResults: placementResults, tips: tips);
   }
 
@@ -393,7 +521,10 @@ Return only JSON matching the required schema.
 
     final now = DateTime.now();
     final horizonStart = DateTime(now.year, now.month, now.day);
-    final busyBlocks = await db.getBusyBlocksInRange(horizonStart, horizonStart.add(Duration(days: horizonDays)));
+    final busyBlocks = await db.getBusyBlocksInRange(
+      horizonStart,
+      horizonStart.add(Duration(days: horizonDays)),
+    );
     final allTasks = await db.getAllTasks();
 
     final result = slotter.reSlotSkippedTask(
@@ -414,7 +545,8 @@ Return only JSON matching the required schema.
           await calendar!.deleteEvent(task.deviceEventId!);
         } catch (_) {}
       }
-      if (result.task.scheduledStart != null && result.task.scheduledEnd != null) {
+      if (result.task.scheduledStart != null &&
+          result.task.scheduledEnd != null) {
         try {
           final newId = await calendar!.writeTaskEvent(result.task);
           await db.updateTask(result.task.copyWith(deviceEventId: newId));
@@ -439,6 +571,10 @@ Return only JSON matching the required schema.
   /// Settings ".ics import" action (SPEC 7.2 / 8). Returns imported block count.
   Future<int> importIcsFile(String filePath, String sourceName) async {
     final content = await File(filePath).readAsString();
+    return importIcsContent(content, sourceName);
+  }
+
+  Future<int> importIcsContent(String content, String sourceName) async {
     final blocks = ExtractionService().parseIcsContent(content, sourceName);
     await db.deleteBusyBlocksBySource(sourceName);
     if (blocks.isNotEmpty) {
@@ -451,10 +587,10 @@ Return only JSON matching the required schema.
   /// Enforces: horizon bounds, known goal_ids, prerequisite graph integrity.
   List<Task> _validateAndConvertTasks(
     List<dynamic> rawTasks,
-    List<Goal> goals,
-    {Map<String, String?> pinnedDeadlines = const {},
-     Set<String> preserveIds = const {}}
-  ) {
+    List<Goal> goals, {
+    Map<String, String?> pinnedDeadlines = const {},
+    Set<String> preserveIds = const {},
+  }) {
     final goalsById = {for (final g in goals) g.id: g};
     final now = DateTime.now();
     final horizonStart = DateTime(now.year, now.month, now.day);
@@ -472,28 +608,34 @@ Return only JSON matching the required schema.
         final title = raw['title'] as String;
         final duration = raw['duration_minutes'] as int;
         final recommendedDay = raw['recommended_day'] as String;
-        final prereqs = (raw['prerequisite_ids'] as List).map((e) => e.toString()).toList();
+        final prereqs = (raw['prerequisite_ids'] as List)
+            .map((e) => e.toString())
+            .toList();
 
         if (!goalsById.containsKey(goalId)) continue;
         if (duration < 5 || duration > 480) continue;
 
         final dayDate = DateTime.tryParse(recommendedDay);
         if (dayDate == null) continue;
-        if (dayDate.isBefore(horizonStart) || dayDate.isAfter(horizonEnd)) continue;
+        if (dayDate.isBefore(horizonStart) || dayDate.isAfter(horizonEnd)) {
+          continue;
+        }
 
         final ourId = preserveIds.contains(taskId) ? taskId : uuid.v4();
         idMap[taskId] = ourId;
 
-        validTasks.add(Task(
-          id: ourId,
-          goalId: goalId,
-          title: title,
-          durationMinutes: duration,
-          recommendedDay: recommendedDay,
-          pinnedDeadline: pinnedDeadlines[taskId],
-          prerequisiteIds: prereqs,
-          createdAt: now.toIso8601String(),
-        ));
+        validTasks.add(
+          Task(
+            id: ourId,
+            goalId: goalId,
+            title: title,
+            durationMinutes: duration,
+            recommendedDay: recommendedDay,
+            pinnedDeadline: pinnedDeadlines[taskId],
+            prerequisiteIds: prereqs,
+            createdAt: now.toIso8601String(),
+          ),
+        );
       } catch (_) {
         continue;
       }

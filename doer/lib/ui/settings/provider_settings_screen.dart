@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+
+import '../widgets.dart';
+
 import 'package:doer/provider/provider_config_service.dart';
 
 /// Settings screen: provider configuration.
@@ -150,105 +153,116 @@ class _ProviderSettingsScreenState extends State<ProviderSettingsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Provider Settings')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          if (_statusMessage != null)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 12),
-              child: Text(
-                _statusMessage!,
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.primary,
-                  fontWeight: FontWeight.w600,
+      body: ContentWidth(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
+          children: [
+            if (_statusMessage != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(
+                  _statusMessage!,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.primary,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
+
+            const SectionHeader('Active mode'),
+            const SizedBox(height: 4),
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'demo', label: Text('Demo')),
+                ButtonSegment(value: 'byok', label: Text('My provider')),
+              ],
+              selected: {_mode},
+              onSelectionChanged: (selection) =>
+                  setState(() => _mode = selection.first),
             ),
+            const SizedBox(height: 4),
+            Text(
+              _mode == 'demo'
+                  ? 'Demo mode: uses the demo endpoint below. Budget is '
+                        'hard-capped by the provider. When exhausted, add your '
+                        'own provider here.'
+                  : 'Your provider: app calls YOUR endpoint directly. Your '
+                        'key stays on this device (Keystore-encrypted).',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 16),
 
-          Text('Active mode', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'demo', label: Text('Demo')),
-              ButtonSegment(value: 'byok', label: Text('My provider')),
-            ],
-            selected: {_mode},
-            onSelectionChanged: (selection) =>
-                setState(() => _mode = selection.first),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            _mode == 'demo'
-                ? 'Demo mode: uses the demo endpoint below. Budget is '
-                    'hard-capped by the provider. When exhausted, add your '
-                    'own provider here.'
-                : 'Your provider: app calls YOUR endpoint directly. Your '
-                    'key stays on this device (Keystore-encrypted).',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 16),
+            const SectionHeader('Demo endpoint'),
+            const SizedBox(height: 8),
+            _field(
+              _demoUrlController,
+              'Base URL',
+              hint: 'https://api.openai.com/v1',
+            ),
+            _field(
+              _demoKeyController,
+              'API key',
+              hint: 'doer-demo-key-v1-public',
+              obscure: true,
+            ),
+            _field(_demoModelController, 'Model name', hint: 'gpt-4o-mini'),
+            const SizedBox(height: 8),
+            FilledButton(
+              onPressed: _mode == 'demo' ? _saveDemo : null,
+              child: const Text('Save demo endpoint'),
+            ),
+            const SizedBox(height: 8),
 
-          Text('Demo endpoint', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
-          _field(_demoUrlController, 'Base URL',
-              hint: 'https://api.openai.com/v1'),
-          _field(_demoKeyController, 'API key',
-              hint: 'doer-demo-key-v1-public', obscure: true),
-          _field(_demoModelController, 'Model name', hint: 'gpt-4o-mini'),
-          const SizedBox(height: 8),
-          FilledButton(
-            onPressed: _mode == 'demo' ? _saveDemo : null,
-            child: const Text('Save demo endpoint'),
-          ),
-          const Divider(height: 32),
-
-          Text('Your own provider',
-              style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
-          DropdownButtonFormField<String>(
-            initialValue: _byokPreset,
-            isExpanded: true,
-            decoration: const InputDecoration(labelText: 'Provider preset'),
-            items: _presets.entries
-                .map((e) => DropdownMenuItem(
+            const SectionHeader('Your own provider'),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<String>(
+              initialValue: _byokPreset,
+              isExpanded: true,
+              decoration: const InputDecoration(labelText: 'Provider preset'),
+              items: _presets.entries
+                  .map(
+                    (e) => DropdownMenuItem(
                       value: e.key,
-                      child: Text(
-                        e.value,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ))
-                .toList(),
-            onChanged: (value) => setState(() {
-              _byokPreset = value ?? 'openai';
-              _byokUrlVisible = _byokPreset == 'custom';
-            }),
-          ),
-          if (_byokUrlVisible)
-            _field(_byokUrlController, 'Base URL',
-                hint: 'https://your-host/v1 (OpenAI-compatible)'),
-          _field(_byokKeyController, 'API key', obscure: true),
-          _field(_byokModelController, 'Model name', hint: 'model-id'),
-          const SizedBox(height: 8),
-          FilledButton(
-            onPressed: _mode == 'byok' ? _saveByok : null,
-            child: const Text('Save my provider'),
-          ),
-        ],
+                      child: Text(e.value, overflow: TextOverflow.ellipsis),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (value) => setState(() {
+                _byokPreset = value ?? 'openai';
+                _byokUrlVisible = _byokPreset == 'custom';
+              }),
+            ),
+            const SizedBox(height: 12),
+            if (_byokUrlVisible)
+              _field(
+                _byokUrlController,
+                'Base URL',
+                hint: 'https://your-host/v1 (OpenAI-compatible)',
+              ),
+            _field(_byokKeyController, 'API key', obscure: true),
+            _field(_byokModelController, 'Model name', hint: 'model-id'),
+            const SizedBox(height: 8),
+            FilledButton(
+              onPressed: _mode == 'byok' ? _saveByok : null,
+              child: const Text('Save my provider'),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _field(TextEditingController controller, String label,
-      {String? hint, bool obscure = false}) {
+  Widget _field(
+    TextEditingController controller,
+    String label, {
+    String? hint,
+    bool obscure = false,
+  }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: TextField(
         controller: controller,
-        decoration: InputDecoration(
-          labelText: label,
-          hintText: hint,
-          border: const OutlineInputBorder(),
-        ),
+        decoration: InputDecoration(labelText: label, hintText: hint),
         obscureText: obscure,
       ),
     );

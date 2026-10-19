@@ -396,3 +396,36 @@ Free-form multi-goal intake (no forced scaffolding): each goal is a short-term t
 - Richer coaching (streak detection, habit-level tips) built on completion history
 - Auto-refresh of the rolling horizon (scheduled, opt-in)
 - Home-screen agenda widget
+
+
+## 16. Web + connected calendars (addendum, 2026-10-16)
+
+- The same Flutter codebase targets Android and web; Android device-calendar behavior remains.
+- Web data lives in browser SQLite (WASM/IndexedDB); there are no login accounts or server DB.
+- One Cloudflare Worker serves the Flutter web build and `/api/*` calendar routes.
+- The backend exception covers Pipedream credentials, ICS fetching, and the built-in demo LLM proxy.
+- BYOK and custom demo calls go directly from the client; built-in demo calls use the Worker proxy.
+- Google Calendar (`google_calendar`) and Outlook (`microsoft_outlook_calendar`) connect through Pipedream.
+- A per-install UUID v4 in secure storage (`pd_external_user_id`) is a bearer identity, never logged.
+- The Worker caches its OAuth token and scopes every proxy operation to the user's owned account.
+- Connected busy reads exclude calendars named exactly `My Plan`; account errors are isolated.
+- ICS HTTPS/webcal subscriptions are read-only and stored locally; `.ics` file imports remain supported.
+- The Worker bounds ICS fetches to 10 seconds/5 MB and rejects private hostnames and redirects.
+- Busy sync uses local midnight through seven calendar days; UTC inputs become local SQLite timestamps.
+- Sync replaces `pd:`/`ics:` sources; total reachability failure preserves saved data and does not block planning.
+- `PlanCalendar` abstracts device and Pipedream projections; web plan target defaults to none.
+- Pipedream event IDs embed their owning account, preserving deletion routing after target changes.
+- Plan rewrites are best effort and batched per account; completed tasks remain frozen.
+- Settings supports connect, refresh/resume, disconnect, web plan target, ICS URLs, and manual sync.
+- `DOER_API_BASE` defaults to same origin on web; Android hides connections until configured.
+- Files are consumed as bytes on all platforms; `flutter_timezone` supplies the initial IANA zone.
+
+### Landing, onboarding, and free planning (2026-10-18)
+- `/` is the static Doer landing page; Flutter lives at `/app/` (base href `/app/`).
+- No accounts: a skippable three-step first run captures a P1 goal, working hours, and optional calendars.
+- The secure-storage `onboarding_done` flag and existing goals prevent repeat onboarding.
+- Built-in demo uses the Worker with the install UUID; OpenRouter secrets never reach the client.
+- Proxy limits: 200 KB input, 4,000 output tokens, 90 s timeout, 6/user and 20/IP requests/minute per location; provider dashboard caps spend.
+- BYOK stays direct; all placement remains deterministic on-device.
+- Done offers five seconds of Undo before monotonic completion; background/disposal flushes pending completions.
+- Goal planning returns to the earliest planned day; archived goals can be restored; web hashes preserve tabs.

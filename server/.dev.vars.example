@@ -1,0 +1,5 @@
+PIPEDREAM_CLIENT_ID=your_oauth_client_id
+PIPEDREAM_CLIENT_SECRET=your_oauth_client_secret
+PIPEDREAM_PROJECT_ID=proj_your_project
+OPENROUTER_API_KEY=
+# Set an OpenRouter dashboard spend limit before enabling free planning.

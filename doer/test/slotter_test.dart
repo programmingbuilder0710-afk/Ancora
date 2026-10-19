@@ -38,6 +38,28 @@ void main() {
     createdAt: '2026-09-27T00:00:00',
   );
 
+  test('never places a session in time that has already passed today', () {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final iso = today.toIso8601String().substring(0, 10);
+    // Whole-day window so the only constraint is "not before now".
+    final slotter = Slotter(UserPreferences(
+      workStart: '00:00',
+      workEnd: '23:59',
+      bufferMinutes: 0,
+      activeDays: const ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'],
+      timezone: 'UTC',
+    ));
+    final results = slotter.placeTasks(
+      tasks: [task('now1', 'g1', iso, duration: 15)],
+      busyBlocks: [],
+      horizonStart: today,
+      horizonDays: 7,
+    );
+    final start = DateTime.parse(results.single.task.scheduledStart!);
+    expect(start.isBefore(now), isFalse, reason: 'placed at $start, now is $now');
+  });
+
   group('free-segment construction and placement', () {
     test('places task on recommended day in earliest free segment', () {
       final slotter = Slotter(prefs);

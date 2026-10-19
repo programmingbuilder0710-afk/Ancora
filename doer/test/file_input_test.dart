@@ -138,13 +138,15 @@ END:VEVENT'''), 'mixed.ics');
 
   group('file input: document extraction', () {
     test('txt extraction reads full text', () async {
-      final f = File('${tmp.path}/notes.txt')..writeAsString('Goal context: learn Rust');
+      final f = File('${tmp.path}/notes.txt');
+      await f.writeAsString('Goal context: learn Rust');
       final text = await service.extractText(f);
       expect(text, contains('learn Rust'));
     });
 
     test('md extraction reads markdown', () async {
-      final f = File('${tmp.path}/plan.md')..writeAsString('# Plan\n- own a cat');
+      final f = File('${tmp.path}/plan.md');
+      await f.writeAsString('# Plan\n- own a cat');
       final text = await service.extractText(f);
       expect(text, contains('own a cat'));
     });
@@ -158,14 +160,16 @@ END:VEVENT'''), 'mixed.ics');
     });
 
     test('unsupported extension returns empty string', () async {
-      final f = File('${tmp.path}/data.xyz')..writeAsString('stuff');
+      final f = File('${tmp.path}/data.xyz');
+      await f.writeAsString('stuff');
       final text = await service.extractText(f);
       expect(text, '');
     });
 
     test('truncation kicks in past 5000 chars and preserves head', () async {
       final long = 'a' * 6000;
-      final f = File('${tmp.path}/big.txt')..writeAsString(long);
+      final f = File('${tmp.path}/big.txt');
+      await f.writeAsString(long);
       final text = await service.extractText(f);
       expect(text.length, lessThan(5100));
       expect(text.startsWith('aaaa'), isTrue);

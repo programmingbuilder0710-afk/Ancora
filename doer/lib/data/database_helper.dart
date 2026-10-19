@@ -1,7 +1,12 @@
 import 'dart:async';
+
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart' as sqflite;
-import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:flutter/foundation.dart';
+
+import 'database_factory_native.dart'
+    if (dart.library.js_interop) 'database_factory_web.dart';
 import '../models/models.dart';
 
 class DatabaseHelper {
@@ -26,13 +31,14 @@ class DatabaseHelper {
 
   Future<Database> _initDatabase() async {
     if (_memoryDb) {
-      return await databaseFactoryFfi.openDatabase(
-        inMemoryDatabasePath,
-        options: sqflite.OpenDatabaseOptions(
-          singleInstance: false,
-          onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
-        ),
-      )..execute('''
+      return await platformDatabaseFactory.openDatabase(
+          inMemoryDatabasePath,
+          options: sqflite.OpenDatabaseOptions(
+            singleInstance: false,
+            onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+          ),
+        )
+        ..execute('''
       CREATE TABLE goals (
         id TEXT PRIMARY KEY,
         parent_goal_id TEXT REFERENCES goals(id),
@@ -43,7 +49,8 @@ class DatabaseHelper {
         status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
         created_at TEXT NOT NULL
       )
-      ''')..execute('''
+      ''')
+        ..execute('''
       CREATE TABLE tasks (
         id TEXT PRIMARY KEY,
         goal_id TEXT NOT NULL REFERENCES goals(id),
@@ -60,21 +67,24 @@ class DatabaseHelper {
         device_event_id TEXT,
         created_at TEXT NOT NULL
       )
-      ''')..execute('''
+      ''')
+        ..execute('''
       CREATE TABLE documents (
         id TEXT PRIMARY KEY,
         goal_id TEXT NOT NULL REFERENCES goals(id),
         filename TEXT NOT NULL,
         extracted_text TEXT NOT NULL
       )
-      ''')..execute('''
+      ''')
+        ..execute('''
       CREATE TABLE busy_blocks (
         id TEXT PRIMARY KEY,
         source TEXT NOT NULL,
         start TEXT NOT NULL,
         end TEXT NOT NULL
       )
-      ''')..execute('''
+      ''')
+        ..execute('''
       CREATE TABLE user_preferences (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         work_start TEXT NOT NULL,
@@ -84,7 +94,8 @@ class DatabaseHelper {
         timezone TEXT NOT NULL,
         plan_calendar_id TEXT
       )
-      ''')..execute('''
+      ''')
+        ..execute('''
       CREATE TABLE provider_config (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         mode TEXT NOT NULL DEFAULT 'demo' CHECK (mode IN ('demo','byok')),
@@ -93,6 +104,16 @@ class DatabaseHelper {
         model TEXT
       )
       ''');
+    }
+    if (kIsWeb) {
+      return platformDatabaseFactory.openDatabase(
+        'doer.db',
+        options: OpenDatabaseOptions(
+          version: 1,
+          onCreate: _onCreate,
+          onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        ),
+      );
     }
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, 'doer.db');
@@ -183,8 +204,12 @@ class DatabaseHelper {
   Future<void> _createIndexes(Database db) async {
     await db.execute('CREATE INDEX idx_tasks_goal_id ON tasks(goal_id)');
     await db.execute('CREATE INDEX idx_tasks_status ON tasks(status)');
-    await db.execute('CREATE INDEX idx_tasks_scheduled_start ON tasks(scheduled_start)');
-    await db.execute('CREATE INDEX idx_busy_blocks_start_end ON busy_blocks(start, end)');
+    await db.execute(
+      'CREATE INDEX idx_tasks_scheduled_start ON tasks(scheduled_start)',
+    );
+    await db.execute(
+      'CREATE INDEX idx_busy_blocks_start_end ON busy_blocks(start, end)',
+    );
     await db.execute('CREATE INDEX idx_goals_status ON goals(status)');
   }
 
@@ -204,7 +229,11 @@ class DatabaseHelper {
   Future<List<Goal>> getAllGoals({bool activeOnly = true}) async {
     final db = await database;
     final where = activeOnly ? "status = 'active'" : null;
-    final maps = await db.query('goals', where: where, orderBy: 'priority, target_date');
+    final maps = await db.query(
+      'goals',
+      where: where,
+      orderBy: 'priority, target_date',
+    );
     return maps.map(Goal.fromMap).toList();
   }
 
@@ -216,7 +245,12 @@ class DatabaseHelper {
 
   Future<int> updateGoal(Goal goal) async {
     final db = await database;
-    return await db.update('goals', goal.toMap(), where: 'id = ?', whereArgs: [goal.id]);
+    return await db.update(
+      'goals',
+      goal.toMap(),
+      where: 'id = ?',
+      whereArgs: [goal.id],
+    );
   }
 
   /// Delete a goal and all dependent rows (tasks, documents) in one
@@ -254,13 +288,23 @@ class DatabaseHelper {
 
   Future<List<Task>> getTasksByGoal(String goalId) async {
     final db = await database;
-    final maps = await db.query('tasks', where: 'goal_id = ?', whereArgs: [goalId], orderBy: 'scheduled_start');
+    final maps = await db.query(
+      'tasks',
+      where: 'goal_id = ?',
+      whereArgs: [goalId],
+      orderBy: 'scheduled_start',
+    );
     return maps.map(Task.fromMap).toList();
   }
 
   Future<List<Task>> getTasksByStatus(TaskStatus status) async {
     final db = await database;
-    final maps = await db.query('tasks', where: 'status = ?', whereArgs: [status.name], orderBy: 'scheduled_start');
+    final maps = await db.query(
+      'tasks',
+      where: 'status = ?',
+      whereArgs: [status.name],
+      orderBy: 'scheduled_start',
+    );
     return maps.map(Task.fromMap).toList();
   }
 
@@ -272,7 +316,12 @@ class DatabaseHelper {
 
   Future<int> updateTask(Task task) async {
     final db = await database;
-    return await db.update('tasks', task.toMap(), where: 'id = ?', whereArgs: [task.id]);
+    return await db.update(
+      'tasks',
+      task.toMap(),
+      where: 'id = ?',
+      whereArgs: [task.id],
+    );
   }
 
   Future<int> deleteTask(String id) async {
@@ -308,7 +357,11 @@ class DatabaseHelper {
 
   Future<List<Map<String, dynamic>>> getDocumentsByGoal(String goalId) async {
     final db = await database;
-    return await db.query('documents', where: 'goal_id = ?', whereArgs: [goalId]);
+    return await db.query(
+      'documents',
+      where: 'goal_id = ?',
+      whereArgs: [goalId],
+    );
   }
 
   // --- Busy Blocks ---
@@ -327,7 +380,10 @@ class DatabaseHelper {
     return blocks.length;
   }
 
-  Future<List<BusyBlock>> getBusyBlocksInRange(DateTime start, DateTime end) async {
+  Future<List<BusyBlock>> getBusyBlocksInRange(
+    DateTime start,
+    DateTime end,
+  ) async {
     final db = await database;
     final maps = await db.query(
       'busy_blocks',
@@ -339,7 +395,11 @@ class DatabaseHelper {
 
   Future<int> deleteBusyBlocksBySource(String source) async {
     final db = await database;
-    return await db.delete('busy_blocks', where: 'source = ?', whereArgs: [source]);
+    return await db.delete(
+      'busy_blocks',
+      where: 'source = ?',
+      whereArgs: [source],
+    );
   }
 
   Future<int> clearBusyBlocks() async {
@@ -371,17 +431,13 @@ class DatabaseHelper {
     String? model,
   }) async {
     final db = await database;
-    return await db.insert(
-      'provider_config',
-      {
-        'id': 1,
-        'mode': mode,
-        'preset': preset,
-        'base_url': baseUrl,
-        'model': model,
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    return await db.insert('provider_config', {
+      'id': 1,
+      'mode': mode,
+      'preset': preset,
+      'base_url': baseUrl,
+      'model': model,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<Map<String, dynamic>?> getProviderConfig() async {
