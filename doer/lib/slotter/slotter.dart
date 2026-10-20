@@ -55,6 +55,17 @@ class Slotter {
         continue;
       }
 
+      if (task.userEdited && task.scheduledStart != null) {
+        // The user moved this task's event in an external calendar app:
+        // the imported schedule is fixed. Occupy the time so other tasks
+        // place around it, but never re-slot it.
+        results.add(PlacementResult(task));
+        _addToOccupied(occupiedByDay, task);
+        final s = DateTime.parse(task.scheduledStart!);
+        batchPlacedDays[task.id] = DateTime(s.year, s.month, s.day);
+        continue;
+      }
+
       final result = _placeSingleTask(
         task,
         occupiedByDay,
@@ -150,10 +161,23 @@ class Slotter {
           map[startDay]!.add(_OccupiedInterval(block.start, block.end));
         }
       } else {
+        // Multi-day block. Clamp to the horizon: a block starting before
+        // horizonStart (ongoing device event, or an .ics VEVENT spanning
+        // today) must still occupy its in-horizon remainder; without the
+        // clamp the loop breaks immediately on the missing pre-horizon key
+        // and the slotter double-books over it. Entirely pre-horizon
+        // blocks are skipped.
+        if (endDay.isBefore(horizonStart)) continue;
+        final effectiveStart = startDay.isBefore(horizonStart)
+            ? DateTime(horizonStart.year, horizonStart.month, horizonStart.day)
+            : startDay;
         for (int i = 0; ; i++) {
-          final day = startDay.add(Duration(days: i));
+          final day = effectiveStart.add(Duration(days: i));
           if (!map.containsKey(day)) break;
-          final segmentStart = i == 0 ? block.start : DateTime(day.year, day.month, day.day);
+          final beganBeforeHorizon = i == 0 && startDay.isBefore(horizonStart);
+          final segmentStart = beganBeforeHorizon
+              ? DateTime(day.year, day.month, day.day)
+              : (i == 0 ? block.start : DateTime(day.year, day.month, day.day));
           final segmentEnd = (day == endDay) ? block.end : DateTime(day.year, day.month, day.day).add(const Duration(days: 1));
           map[day]!.add(_OccupiedInterval(segmentStart, segmentEnd));
           if (day == endDay) break;

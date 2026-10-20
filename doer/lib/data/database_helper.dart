@@ -1,10 +1,7 @@
 import 'dart:async';
-
 import 'package:path/path.dart';
-import 'package:sqflite/sqflite.dart' as sqflite;
-import 'package:sqflite/sqflite.dart';
-import 'package:flutter/foundation.dart';
-
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'database_factory_native.dart'
     if (dart.library.js_interop) 'database_factory_web.dart';
 import '../models/models.dart';
@@ -31,86 +28,30 @@ class DatabaseHelper {
 
   Future<Database> _initDatabase() async {
     if (_memoryDb) {
-      return await platformDatabaseFactory.openDatabase(
-          inMemoryDatabasePath,
-          options: sqflite.OpenDatabaseOptions(
-            singleInstance: false,
-            onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
-          ),
-        )
-        ..execute('''
-      CREATE TABLE goals (
-        id TEXT PRIMARY KEY,
-        parent_goal_id TEXT REFERENCES goals(id),
-        title TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        priority TEXT NOT NULL CHECK (priority IN ('P1','P2','P3')),
-        target_date TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
-        created_at TEXT NOT NULL
-      )
-      ''')
-        ..execute('''
-      CREATE TABLE tasks (
-        id TEXT PRIMARY KEY,
-        goal_id TEXT NOT NULL REFERENCES goals(id),
-        title TEXT NOT NULL,
-        duration_minutes INTEGER NOT NULL,
-        recommended_day TEXT,
-        pinned_deadline TEXT,
-        prerequisite_ids TEXT NOT NULL DEFAULT '[]',
-        scheduled_start TEXT,
-        scheduled_end TEXT,
-        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','skipped')),
-        adjusted INTEGER NOT NULL DEFAULT 0,
-        skip_count INTEGER NOT NULL DEFAULT 0,
-        device_event_id TEXT,
-        created_at TEXT NOT NULL
-      )
-      ''')
-        ..execute('''
-      CREATE TABLE documents (
-        id TEXT PRIMARY KEY,
-        goal_id TEXT NOT NULL REFERENCES goals(id),
-        filename TEXT NOT NULL,
-        extracted_text TEXT NOT NULL
-      )
-      ''')
-        ..execute('''
-      CREATE TABLE busy_blocks (
-        id TEXT PRIMARY KEY,
-        source TEXT NOT NULL,
-        start TEXT NOT NULL,
-        end TEXT NOT NULL
-      )
-      ''')
-        ..execute('''
-      CREATE TABLE user_preferences (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        work_start TEXT NOT NULL,
-        work_end TEXT NOT NULL,
-        buffer_minutes INTEGER NOT NULL DEFAULT 10,
-        active_days TEXT NOT NULL DEFAULT '["mon","tue","wed","thu","fri"]',
-        timezone TEXT NOT NULL,
-        plan_calendar_id TEXT
-      )
-      ''')
-        ..execute('''
-      CREATE TABLE provider_config (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        mode TEXT NOT NULL DEFAULT 'demo' CHECK (mode IN ('demo','byok')),
-        preset TEXT,
-        base_url TEXT,
-        model TEXT
-      )
-      ''');
+      // Same schema as production — _onCreate is the single source of
+      // truth, so schema changes (busy_blocks.title, tasks.user_edited,
+      // ...) apply to both paths together. No-isolate FFI completes via
+      // microtasks, which progress inside testWidgets' fake-async zone;
+      // the isolate-based platformDatabaseFactory would hang pumpAndSettle.
+      return await databaseFactoryFfiNoIsolate.openDatabase(
+        inMemoryDatabasePath,
+        options: OpenDatabaseOptions(
+          version: 3,
+          onCreate: _onCreate,
+          onUpgrade: _onUpgrade,
+          onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        ),
+      );
     }
     if (kIsWeb) {
+      // Browser: sqflite wasm (IndexedDB-backed); flat name, no path
+      // helpers (getDatabasesPath throws on the web).
       return platformDatabaseFactory.openDatabase(
         'doer.db',
         options: OpenDatabaseOptions(
-          version: 1,
+          version: 3,
           onCreate: _onCreate,
+          onUpgrade: _onUpgrade,
           onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
         ),
       );
@@ -119,10 +60,28 @@ class DatabaseHelper {
     final path = join(dbPath, 'doer.db');
     return await openDatabase(
       path,
-      version: 1,
+      version: 3,
       onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
       onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
     );
+  }
+
+  /// v1 -> v2: busy_blocks gains an event title column so device-synced
+  /// events can be rendered with their real names. Null-safe for legacy
+  /// rows and .ics imports.
+  /// v2 -> v3: tasks gains user_edited — a user moved the task's event in
+  /// an external calendar app; the imported time is fixed and the slotter
+  /// must not re-slot it.
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await db.execute(
+          "ALTER TABLE busy_blocks ADD COLUMN title TEXT");
+    }
+    if (oldVersion < 3) {
+      await db.execute(
+          "ALTER TABLE tasks ADD COLUMN user_edited INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   Future<void> _onCreate(Database db, int version) async {
@@ -154,6 +113,7 @@ class DatabaseHelper {
         adjusted INTEGER NOT NULL DEFAULT 0,
         skip_count INTEGER NOT NULL DEFAULT 0,
         device_event_id TEXT,
+        user_edited INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       )
     ''');
@@ -172,7 +132,8 @@ class DatabaseHelper {
         id TEXT PRIMARY KEY,
         source TEXT NOT NULL,
         start TEXT NOT NULL,
-        end TEXT NOT NULL
+        end TEXT NOT NULL,
+        title TEXT
       )
     ''');
 
@@ -204,12 +165,8 @@ class DatabaseHelper {
   Future<void> _createIndexes(Database db) async {
     await db.execute('CREATE INDEX idx_tasks_goal_id ON tasks(goal_id)');
     await db.execute('CREATE INDEX idx_tasks_status ON tasks(status)');
-    await db.execute(
-      'CREATE INDEX idx_tasks_scheduled_start ON tasks(scheduled_start)',
-    );
-    await db.execute(
-      'CREATE INDEX idx_busy_blocks_start_end ON busy_blocks(start, end)',
-    );
+    await db.execute('CREATE INDEX idx_tasks_scheduled_start ON tasks(scheduled_start)');
+    await db.execute('CREATE INDEX idx_busy_blocks_start_end ON busy_blocks(start, end)');
     await db.execute('CREATE INDEX idx_goals_status ON goals(status)');
   }
 
@@ -229,11 +186,7 @@ class DatabaseHelper {
   Future<List<Goal>> getAllGoals({bool activeOnly = true}) async {
     final db = await database;
     final where = activeOnly ? "status = 'active'" : null;
-    final maps = await db.query(
-      'goals',
-      where: where,
-      orderBy: 'priority, target_date',
-    );
+    final maps = await db.query('goals', where: where, orderBy: 'priority, target_date');
     return maps.map(Goal.fromMap).toList();
   }
 
@@ -245,12 +198,7 @@ class DatabaseHelper {
 
   Future<int> updateGoal(Goal goal) async {
     final db = await database;
-    return await db.update(
-      'goals',
-      goal.toMap(),
-      where: 'id = ?',
-      whereArgs: [goal.id],
-    );
+    return await db.update('goals', goal.toMap(), where: 'id = ?', whereArgs: [goal.id]);
   }
 
   /// Delete a goal and all dependent rows (tasks, documents) in one
@@ -288,23 +236,13 @@ class DatabaseHelper {
 
   Future<List<Task>> getTasksByGoal(String goalId) async {
     final db = await database;
-    final maps = await db.query(
-      'tasks',
-      where: 'goal_id = ?',
-      whereArgs: [goalId],
-      orderBy: 'scheduled_start',
-    );
+    final maps = await db.query('tasks', where: 'goal_id = ?', whereArgs: [goalId], orderBy: 'scheduled_start');
     return maps.map(Task.fromMap).toList();
   }
 
   Future<List<Task>> getTasksByStatus(TaskStatus status) async {
     final db = await database;
-    final maps = await db.query(
-      'tasks',
-      where: 'status = ?',
-      whereArgs: [status.name],
-      orderBy: 'scheduled_start',
-    );
+    final maps = await db.query('tasks', where: 'status = ?', whereArgs: [status.name], orderBy: 'scheduled_start');
     return maps.map(Task.fromMap).toList();
   }
 
@@ -316,12 +254,7 @@ class DatabaseHelper {
 
   Future<int> updateTask(Task task) async {
     final db = await database;
-    return await db.update(
-      'tasks',
-      task.toMap(),
-      where: 'id = ?',
-      whereArgs: [task.id],
-    );
+    return await db.update('tasks', task.toMap(), where: 'id = ?', whereArgs: [task.id]);
   }
 
   Future<int> deleteTask(String id) async {
@@ -357,11 +290,7 @@ class DatabaseHelper {
 
   Future<List<Map<String, dynamic>>> getDocumentsByGoal(String goalId) async {
     final db = await database;
-    return await db.query(
-      'documents',
-      where: 'goal_id = ?',
-      whereArgs: [goalId],
-    );
+    return await db.query('documents', where: 'goal_id = ?', whereArgs: [goalId]);
   }
 
   // --- Busy Blocks ---
@@ -380,10 +309,7 @@ class DatabaseHelper {
     return blocks.length;
   }
 
-  Future<List<BusyBlock>> getBusyBlocksInRange(
-    DateTime start,
-    DateTime end,
-  ) async {
+  Future<List<BusyBlock>> getBusyBlocksInRange(DateTime start, DateTime end) async {
     final db = await database;
     final maps = await db.query(
       'busy_blocks',
@@ -395,11 +321,7 @@ class DatabaseHelper {
 
   Future<int> deleteBusyBlocksBySource(String source) async {
     final db = await database;
-    return await db.delete(
-      'busy_blocks',
-      where: 'source = ?',
-      whereArgs: [source],
-    );
+    return await db.delete('busy_blocks', where: 'source = ?', whereArgs: [source]);
   }
 
   Future<int> clearBusyBlocks() async {
@@ -431,13 +353,17 @@ class DatabaseHelper {
     String? model,
   }) async {
     final db = await database;
-    return await db.insert('provider_config', {
-      'id': 1,
-      'mode': mode,
-      'preset': preset,
-      'base_url': baseUrl,
-      'model': model,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    return await db.insert(
+      'provider_config',
+      {
+        'id': 1,
+        'mode': mode,
+        'preset': preset,
+        'base_url': baseUrl,
+        'model': model,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
   }
 
   Future<Map<String, dynamic>?> getProviderConfig() async {

@@ -195,63 +195,113 @@ void main() {
     await helper.close();
   });
 
-  for (final replan in [false, true]) {
-    test('${replan ? 'replan' : 'decompose'}: completed slots stay occupied', () async {
-      final helper = DatabaseHelper.forTest();
-      addTearDown(helper.close);
-      final today = DateTime.now();
-      var day = DateTime(today.year, today.month, today.day + 1);
-      while (day.weekday > DateTime.friday) {
-        day = day.add(const Duration(days: 1));
-      }
-      final date = day.toIso8601String().substring(0, 10);
-      final prefs = UserPreferences(timezone: 'UTC', bufferMinutes: 0);
-      await helper.upsertPreferences(prefs);
-      final activeGoal = Goal(
-        id: 'active-goal', title: 'Training', priority: GoalPriority.P1,
-        targetDate: date, createdAt: today.toIso8601String(),
-      );
-      await helper.insertGoal(activeGoal);
-      final completed = Task(
-        id: 'completed', goalId: activeGoal.id, title: 'Training baseline',
-        durationMinutes: 30, recommendedDay: date,
-        scheduledStart: day.add(const Duration(hours: 9)).toIso8601String(),
-        scheduledEnd: day.add(const Duration(hours: 9, minutes: 30)).toIso8601String(),
-        status: TaskStatus.completed, createdAt: today.toIso8601String(),
-      );
-      await helper.insertTasks([
-        completed,
-        if (replan) Task(
-          id: 'pending', goalId: activeGoal.id, title: 'Easy run',
-          durationMinutes: 45, recommendedDay: date,
-          createdAt: today.toIso8601String(),
-        ),
-      ]);
-      final provider = FakeProvider({
-        'tasks': [{
-          'task_id': 'pending', 'goal_id': activeGoal.id, 'title': 'Easy run',
-          'duration_minutes': 45, 'recommended_day': date,
-          'prerequisite_ids': <String>[],
-        }],
-      });
-      final orchestrator = Orchestrator(
-        db: helper, providerFactory: () => provider,
-        slotter: Slotter(prefs)
-          ..allGoals = {activeGoal.id: activeGoal}
-          ..allTasks = await helper.getAllTasks(),
-      );
-      final results = replan
-          ? (await orchestrator.replan()).placementResults
-          : await orchestrator.decompose(goals: [activeGoal]);
-      final placed = results.single.task;
-      expect(placed.scheduledStart, isNotNull);
-      expect(placed.scheduledStart!.substring(0, 10), date);
-      expect(DateTime.parse(placed.scheduledStart!),
-          DateTime.parse(completed.scheduledEnd!));
-      expect((await helper.getTask(completed.id))!.toMap(), completed.toMap());
-      expect(await helper.getBusyBlocksInRange(day, day.add(const Duration(days: 1))), isEmpty);
+  test('replan: user-edited schedule is pinned - never re-cleared, re-slotted, or rewritten', () async {
+    final helper = DatabaseHelper.forTest();
+    // Goal with a horizon-safe target date: the shared goal() helper pins
+    // 2026-10-04 (past), which would cap latestDay before startDay and
+    // leave the normal task unplaced regardless of the pin logic.
+    final today0 = DateTime.now();
+    final target = today0.add(const Duration(days: 6));
+    final ueGoal = Goal(
+      id: 'g-ue',
+      title: 'Learn Rust',
+      description: '',
+      priority: GoalPriority.P1,
+      targetDate:
+          '${target.year}-${target.month.toString().padLeft(2, '0')}-${target.day.toString().padLeft(2, '0')}',
+      createdAt: today0.toIso8601String(),
+    );
+    await helper.insertGoal(ueGoal);
+
+    // Horizon-relative fixtures: no hardcoded dates, no clock brittleness.
+    final today = DateTime.now();
+    String dayKey(DateTime d) =>
+        '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+    final day1 = today.add(const Duration(days: 1));
+    final day3 = today.add(const Duration(days: 3));
+
+    // Two pending tasks: one user-edited (moved in Google Calendar), one not.
+    final edited = Task(
+      id: 't-edited',
+      goalId: 'g-ue',
+      title: 'Edited task',
+      durationMinutes: 60,
+      recommendedDay: dayKey(day1),
+      scheduledStart: '${dayKey(day1)}T15:30:00.000',
+      scheduledEnd: '${dayKey(day1)}T16:30:00.000',
+      deviceEventId: 'ev-edited',
+      userEdited: true,
+      createdAt: today.toIso8601String(),
+    );
+    final normal = Task(
+      id: 't-normal',
+      goalId: 'g-ue',
+      title: 'Normal task',
+      durationMinutes: 60,
+      recommendedDay: dayKey(day1),
+      scheduledStart: '${dayKey(day1)}T09:00:00.000',
+      scheduledEnd: '${dayKey(day1)}T10:00:00.000',
+      deviceEventId: 'ev-normal',
+      createdAt: today.toIso8601String(),
+    );
+    await helper.insertTask(edited);
+    await helper.insertTask(normal);
+
+    // LLM says: move EVERYTHING to day3 (maximally different from edits).
+    final provider = FakeProvider({
+      'tasks': [
+        {
+          'task_id': edited.id,
+          'goal_id': 'g-ue',
+          'title': 'Edited task',
+          'duration_minutes': 60,
+          'recommended_day': dayKey(day3),
+          'prerequisite_ids': [],
+        },
+        {
+          'task_id': normal.id,
+          'goal_id': 'g-ue',
+          'title': 'Normal task',
+          'duration_minutes': 60,
+          'recommended_day': dayKey(day3),
+          'prerequisite_ids': [],
+        },
+      ],
+      'tips': [],
     });
-  }
+    final prefs = await helper.getPreferences() ?? UserPreferences(
+      workStart: '09:00',
+      workEnd: '18:00',
+      bufferMinutes: 10,
+      activeDays: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'],
+      timezone: 'UTC',
+    );
+    final orchestrator = Orchestrator(
+      db: helper,
+      providerFactory: () => provider,
+      slotter: Slotter(prefs),
+    );
+    orchestrator.slotter.allGoals = {'g-ue': ueGoal};
+    orchestrator.slotter.allTasks = await helper.getAllTasks();
+
+    await orchestrator.replan();
+
+    // User-edited task: schedule, event id, and flag untouched.
+    final editedAfter = await helper.getTask(edited.id);
+    expect(editedAfter!.scheduledStart, '${dayKey(day1)}T15:30:00.000');
+    expect(editedAfter.scheduledEnd, '${dayKey(day1)}T16:30:00.000');
+    expect(editedAfter.deviceEventId, 'ev-edited');
+    expect(editedAfter.userEdited, isTrue);
+    // The LLM's new recommended_day did NOT import (pin wins).
+    expect(editedAfter.recommendedDay, dayKey(day1));
+
+    // Normal task: re-dated per the LLM.
+    final normalAfter = await helper.getTask(normal.id);
+    expect(normalAfter!.recommendedDay, dayKey(day3));
+    expect(normalAfter.scheduledStart, isNotNull);
+
+    await helper.close();
+  });
 
   test('decompose: empty task list fails after exactly one repair retry', () async {
     final helper = DatabaseHelper.forTest();

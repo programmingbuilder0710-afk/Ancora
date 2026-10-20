@@ -449,6 +449,12 @@ Return only JSON matching the required schema.
     for (final task in tasks) {
       final existing = unfinished.firstWhereOrNull((t) => t.id == task.id);
       if (existing == null) continue; // unknown task_id dropped
+      // User-edited schedules survive re-planning: the user moved the
+      // event in an external calendar; the slotter treats it as fixed.
+      if (existing.userEdited && existing.scheduledStart != null) {
+        updatedUnfinished.add(existing);
+        continue;
+      }
       final cleared = Task(
         id: existing.id,
         goalId: existing.goalId,
@@ -463,6 +469,7 @@ Return only JSON matching the required schema.
         adjusted: existing.adjusted,
         skipCount: existing.skipCount,
         deviceEventId: existing.deviceEventId,
+        userEdited: false,
         createdAt: existing.createdAt,
       );
       updatedUnfinished.add(cleared);
@@ -492,6 +499,8 @@ Return only JSON matching the required schema.
     if (calendar != null) {
       final existingIds = <String, String>{};
       for (final t in unfinished) {
+        // User-edited events keep their device event untouched.
+        if (t.userEdited && t.scheduledStart != null) continue;
         if (t.deviceEventId != null) existingIds[t.id] = t.deviceEventId!;
       }
       final newIds = await calendar!.atomicRewrite(

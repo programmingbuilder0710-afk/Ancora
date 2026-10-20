@@ -1,15 +1,13 @@
 import 'package:flutter/material.dart';
-
-import '../widgets.dart';
-
 import 'package:doer/provider/provider_config_service.dart';
 
 /// Settings screen: provider configuration.
 ///
-/// Demo mode: "Demo endpoint" section - three fields, saved locally.
+/// Demo mode: a fixed, read-only endpoint (build-time defaults) with a
+/// single activate button — no editable fields.
 /// BYOK mode: "Your own provider" section - preset dropdown (OpenAI /
-/// Anthropic / Gemini / OpenRouter / Custom); Custom reveals the Base URL
-/// field. API key + model name always editable.
+/// Anthropic / Gemini / OpenRouter); the preset's base URL is applied
+/// automatically. API key + model name are the only other options.
 /// The API key is stored in flutter_secure_storage (Android Keystore);
 /// never in SQLite, never logged.
 class ProviderSettingsScreen extends StatefulWidget {
@@ -17,9 +15,12 @@ class ProviderSettingsScreen extends StatefulWidget {
 
   /// Initial values, loaded by the caller (avoids async-in-initState).
   final String initialMode;
-  final String initialDemoApiKey;
-  final String initialDemoBaseUrl;
-  final String initialDemoModel;
+
+  /// Accepted for API compatibility with the merged PR's caller; the
+  /// demo endpoint is fixed, so these values are ignored.
+  final String? initialDemoApiKey;
+  final String? initialDemoBaseUrl;
+  final String? initialDemoModel;
   final String? initialByokApiKey;
   final String? initialByokBaseUrl;
   final String? initialByokModel;
@@ -28,9 +29,9 @@ class ProviderSettingsScreen extends StatefulWidget {
     super.key,
     required this.configService,
     required this.initialMode,
-    required this.initialDemoApiKey,
-    required this.initialDemoBaseUrl,
-    required this.initialDemoModel,
+    this.initialDemoApiKey,
+    this.initialDemoBaseUrl,
+    this.initialDemoModel,
     this.initialByokApiKey,
     this.initialByokBaseUrl,
     this.initialByokModel,
@@ -41,16 +42,11 @@ class ProviderSettingsScreen extends StatefulWidget {
 }
 
 class _ProviderSettingsScreenState extends State<ProviderSettingsScreen> {
-  final _demoKeyController = TextEditingController();
-  final _demoUrlController = TextEditingController();
-  final _demoModelController = TextEditingController();
   final _byokKeyController = TextEditingController();
-  final _byokUrlController = TextEditingController();
   final _byokModelController = TextEditingController();
 
   late String _mode;
   String _byokPreset = 'openai';
-  bool _byokUrlVisible = false;
   String? _statusMessage;
 
   static const _presets = {
@@ -58,31 +54,23 @@ class _ProviderSettingsScreenState extends State<ProviderSettingsScreen> {
     'anthropic': 'Anthropic',
     'gemini': 'Google Gemini',
     'openrouter': 'OpenRouter',
-    'custom': 'Custom (any OpenAI-compatible / self-hosted vLLM)',
   };
 
   @override
   void initState() {
     super.initState();
     _mode = widget.initialMode;
-    _demoKeyController.text = widget.initialDemoApiKey;
-    _demoUrlController.text = widget.initialDemoBaseUrl;
-    _demoModelController.text = widget.initialDemoModel;
 
     if (widget.initialByokApiKey != null &&
         widget.initialByokBaseUrl != null &&
         widget.initialByokModel != null) {
       _byokKeyController.text = widget.initialByokApiKey!;
-      _byokUrlController.text = widget.initialByokBaseUrl!;
       _byokModelController.text = widget.initialByokModel!;
       _byokPreset = _presets.keys.firstWhere(
-        (p) =>
-            p != 'custom' &&
-            widget.initialByokBaseUrl!.contains(_presetHost(p)),
-        orElse: () => 'custom',
+        (p) => widget.initialByokBaseUrl!.contains(_presetHost(p)),
+        orElse: () => 'openrouter',
       );
     }
-    _byokUrlVisible = _byokPreset == 'custom';
   }
 
   String _presetHost(String preset) {
@@ -101,17 +89,14 @@ class _ProviderSettingsScreenState extends State<ProviderSettingsScreen> {
   }
 
   Future<void> _saveDemo() async {
-    if (_demoUrlController.text.trim().isEmpty ||
-        _demoModelController.text.trim().isEmpty) {
-      _showStatus('Base URL and model are required.');
-      return;
-    }
+    // Demo endpoint is fixed: persist the built-in defaults (any
+    // previously stored demo values are overwritten by them).
     await widget.configService.saveDemoConfig(
-      apiKey: _demoKeyController.text.trim(),
-      baseUrl: _demoUrlController.text.trim(),
-      model: _demoModelController.text.trim(),
+      apiKey: ProviderConfigService.defaultDemoApiKey,
+      baseUrl: ProviderConfigService.defaultDemoBaseUrl,
+      model: ProviderConfigService.defaultDemoModel,
     );
-    _showStatus('Demo endpoint saved.');
+    _showStatus('Demo endpoint activated.');
   }
 
   Future<void> _saveByok() async {
@@ -121,15 +106,10 @@ class _ProviderSettingsScreenState extends State<ProviderSettingsScreen> {
       _showStatus('API key and model are required.');
       return;
     }
-    if (_byokPreset == 'custom' && _byokUrlController.text.trim().isEmpty) {
-      _showStatus('Custom providers need a Base URL.');
-      return;
-    }
     await widget.configService.saveByokConfig(
       preset: _byokPreset,
       apiKey: key,
       model: model,
-      baseUrl: _byokUrlController.text.trim(),
     );
     _showStatus('Your provider saved and activated.');
   }
@@ -140,11 +120,7 @@ class _ProviderSettingsScreenState extends State<ProviderSettingsScreen> {
 
   @override
   void dispose() {
-    _demoKeyController.dispose();
-    _demoUrlController.dispose();
-    _demoModelController.dispose();
     _byokKeyController.dispose();
-    _byokUrlController.dispose();
     _byokModelController.dispose();
     super.dispose();
   }
@@ -153,116 +129,113 @@ class _ProviderSettingsScreenState extends State<ProviderSettingsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Provider Settings')),
-      body: ContentWidth(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
-          children: [
-            if (_statusMessage != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Text(
-                  _statusMessage!,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.primary,
-                    fontWeight: FontWeight.w600,
-                  ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (_statusMessage != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(
+                _statusMessage!,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.primary,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
+            ),
 
-            const SectionHeader('Active mode'),
-            const SizedBox(height: 4),
-            SegmentedButton<String>(
-              segments: const [
-                ButtonSegment(value: 'demo', label: Text('Demo')),
-                ButtonSegment(value: 'byok', label: Text('My provider')),
-              ],
-              selected: {_mode},
-              onSelectionChanged: (selection) =>
-                  setState(() => _mode = selection.first),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              _mode == 'demo'
-                  ? 'Demo mode: uses the demo endpoint below. Budget is '
-                        'hard-capped by the provider. When exhausted, add your '
-                        'own provider here.'
-                  : 'Your provider: app calls YOUR endpoint directly. Your '
-                        'key stays on this device (Keystore-encrypted).',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-            const SizedBox(height: 16),
+          Text('Active mode', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 4),
+          SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: 'demo', label: Text('Demo')),
+              ButtonSegment(value: 'byok', label: Text('My provider')),
+            ],
+            selected: {_mode},
+            onSelectionChanged: (selection) =>
+                setState(() => _mode = selection.first),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            _mode == 'demo'
+                ? 'Demo mode: uses the demo endpoint below. Budget is '
+                    'hard-capped by the provider. When exhausted, add your '
+                    'own provider here.'
+                : 'Your provider: app calls YOUR endpoint directly. Your '
+                    'key stays on this device (Keystore-encrypted).',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 16),
 
-            const SectionHeader('Demo endpoint'),
-            const SizedBox(height: 8),
-            _field(
-              _demoUrlController,
-              'Base URL',
-              hint: 'https://api.openai.com/v1',
-            ),
-            _field(
-              _demoKeyController,
-              'API key',
-              hint: 'doer-demo-key-v1-public',
-              obscure: true,
-            ),
-            _field(_demoModelController, 'Model name', hint: 'gpt-4o-mini'),
-            const SizedBox(height: 8),
-            FilledButton(
-              onPressed: _mode == 'demo' ? _saveDemo : null,
-              child: const Text('Save demo endpoint'),
-            ),
-            const SizedBox(height: 8),
-
-            const SectionHeader('Your own provider'),
-            const SizedBox(height: 8),
-            DropdownButtonFormField<String>(
-              initialValue: _byokPreset,
-              isExpanded: true,
-              decoration: const InputDecoration(labelText: 'Provider preset'),
-              items: _presets.entries
-                  .map(
-                    (e) => DropdownMenuItem(
-                      value: e.key,
-                      child: Text(e.value, overflow: TextOverflow.ellipsis),
-                    ),
-                  )
-                  .toList(),
-              onChanged: (value) => setState(() {
-                _byokPreset = value ?? 'openai';
-                _byokUrlVisible = _byokPreset == 'custom';
-              }),
-            ),
-            const SizedBox(height: 12),
-            if (_byokUrlVisible)
-              _field(
-                _byokUrlController,
-                'Base URL',
-                hint: 'https://your-host/v1 (OpenAI-compatible)',
+          Text('Demo endpoint', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          Card(
+            margin: EdgeInsets.zero,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(ProviderConfigService.defaultDemoBaseUrl),
+                  const SizedBox(height: 2),
+                  Text(
+                    ProviderConfigService.defaultDemoModel,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
               ),
-            _field(_byokKeyController, 'API key', obscure: true),
-            _field(_byokModelController, 'Model name', hint: 'model-id'),
-            const SizedBox(height: 8),
-            FilledButton(
-              onPressed: _mode == 'byok' ? _saveByok : null,
-              child: const Text('Save my provider'),
             ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 8),
+          FilledButton(
+            onPressed: _mode == 'demo' ? _saveDemo : null,
+            child: const Text('Use demo endpoint'),
+          ),
+          const Divider(height: 32),
+
+          Text('Your own provider',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<String>(
+            initialValue: _byokPreset,
+            isExpanded: true,
+            decoration: const InputDecoration(labelText: 'Provider preset'),
+            items: _presets.entries
+                .map((e) => DropdownMenuItem(
+                      value: e.key,
+                      child: Text(
+                        e.value,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ))
+                .toList(),
+            onChanged: (value) => setState(() {
+              _byokPreset = value ?? 'openai';
+            }),
+          ),
+          _field(_byokKeyController, 'API key', obscure: true),
+          _field(_byokModelController, 'Model name', hint: 'model-id'),
+          const SizedBox(height: 8),
+          FilledButton(
+            onPressed: _mode == 'byok' ? _saveByok : null,
+            child: const Text('Save my provider'),
+          ),
+        ],
       ),
     );
   }
 
-  Widget _field(
-    TextEditingController controller,
-    String label, {
-    String? hint,
-    bool obscure = false,
-  }) {
+  Widget _field(TextEditingController controller, String label,
+      {String? hint, bool obscure = false}) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: TextField(
         controller: controller,
-        decoration: InputDecoration(labelText: label, hintText: hint),
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: hint,
+          border: const OutlineInputBorder(),
+        ),
         obscureText: obscure,
       ),
     );

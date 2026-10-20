@@ -1,678 +1,598 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
-import '../../app_services.dart';
+import '../../app.dart';
 import '../../models/models.dart';
-import '../../orchestration/orchestrator.dart';
-import '../dialogs.dart';
-import '../widgets.dart';
-import '../task_details.dart';
-import '../replan/replan_result_screen.dart';
+import '../../provider/provider.dart';
 
+/// Agenda home screen: 7-day swipeable pager over the rolling horizon.
+/// Tasks grouped by goal, ordered by time; per-task quick actions
+/// Done / Didn't Start; Re-plan action; adjusted / needs-attention
+/// markers; calendar-error banner area (SPEC 8.1 #1).
 class AgendaScreen extends StatefulWidget {
+  const AgendaScreen({super.key, required this.services});
+
   final AppServices services;
-  final DateTime? initialDay;
-  final void Function(Object) onProviderError;
-  final VoidCallback onAddGoal;
-  const AgendaScreen({
-    super.key,
-    this.initialDay,
-    required this.services,
-    required this.onProviderError,
-    required this.onAddGoal,
-  });
 
   @override
   State<AgendaScreen> createState() => _AgendaScreenState();
 }
 
 class _AgendaScreenState extends State<AgendaScreen> {
-  List<Goal> _goals = [];
+  static const int horizonDays = 7;
+
+  final PageController _pageController = PageController();
   List<Task> _tasks = [];
-  DateTime _day = DateUtils.dateOnly(DateTime.now());
-  bool _loading = true;
-  bool _busy = false;
-  String? _error;
-  final _pendingDone = <String>{};
-  late final AppLifecycleListener _lifecycle;
-  late final Timer _clockTimer;
-
-  Future<void> _commit(String id) async {
-    if (!_pendingDone.remove(id)) return;
-    try {
-      await (await widget.services.orchestrator()).completeTask(id);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(providerErrorMessage(e, demoMode: false))),
-        );
-      }
-    }
-    if (mounted) await _reload();
-  }
-
-  void _commitAll() {
-    for (final id in _pendingDone.toList()) {
-      unawaited(_commit(id));
-    }
-  }
-
-  void _onBackground() {
-    _commitAll();
-    if (mounted) ScaffoldMessenger.of(context).clearSnackBars();
-  }
-
-  @override
-  void dispose() {
-    _commitAll();
-    _clockTimer.cancel();
-    _lifecycle.dispose();
-    super.dispose();
-  }
-
-  void _markDone(Task task) {
-    setState(() => _pendingDone.add(task.id));
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.hideCurrentSnackBar();
-    messenger
-        .showSnackBar(
-          SnackBar(
-            content: const Text('Marked done'),
-            persist: false,
-            duration: const Duration(seconds: 5),
-            action: SnackBarAction(
-              label: 'Undo',
-              onPressed: () {
-                if (mounted) setState(() => _pendingDone.remove(task.id));
-              },
-            ),
-          ),
-        )
-        .closed
-        .then((_) => _commit(task.id));
-  }
+  Map<String, Goal> _goalsById = {};
+  List<BusyBlock> _busy = [];
+  bool _replanning = false;
 
   @override
   void initState() {
     super.initState();
-    _day = DateUtils.dateOnly(widget.initialDay ?? DateTime.now());
-    _lifecycle = AppLifecycleListener(
-      onHide: _onBackground,
-      onPause: _onBackground,
-    );
-    _clockTimer = Timer.periodic(
-      const Duration(minutes: 1),
-      (_) => setState(() {}),
-    );
     _reload();
+    DataReload.revision.addListener(_reload);
+  }
+
+  @override
+  void dispose() {
+    DataReload.revision.removeListener(_reload);
+    _pageController.dispose();
+    super.dispose();
   }
 
   Future<void> _reload() async {
-    try {
-      final goals = await widget.services.db.getAllGoals(activeOnly: false);
-      final tasks = await widget.services.db.getAllTasks();
-      if (mounted) {
-        setState(() {
-          _goals = goals;
-          _tasks = tasks;
-          _error = null;
-        });
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _error = providerErrorMessage(e, demoMode: false));
-      }
-    } finally {
-      if (mounted) setState(() => _loading = false);
-    }
+    final tasks = await widget.services.db.getAllTasks();
+    final goals = await widget.services.db.getAllGoals(activeOnly: false);
+    final now = DateTime.now();
+    final busy = await widget.services.db.getBusyBlocksInRange(
+        DateTime(now.year, now.month, now.day),
+        DateTime(now.year, now.month, now.day)
+            .add(const Duration(days: horizonDays)));
+    if (!mounted) return;
+    setState(() {
+      _tasks = tasks;
+      _goalsById = {for (final g in goals) g.id: g};
+      _busy = busy;
+    });
   }
 
-  Future<void> _taskAction(Task task, {required bool done}) async {
-    if (done) {
-      _markDone(task);
+  DateTime get _today {
+    final now = DateTime.now();
+    return DateTime(now.year, now.month, now.day);
+  }
+
+  DateTime _dayFor(int index) => _today.add(Duration(days: index));
+
+  String _dayKey(DateTime day) {
+    final m = day.month.toString().padLeft(2, '0');
+    final d = day.day.toString().padLeft(2, '0');
+    return '${day.year}-$m-$d';
+  }
+
+  /// Tasks scheduled on [day], ordered by start time. Scheduled strings are
+  /// local ISO datetimes whose first 10 chars are the calendar day.
+  List<Task> _tasksFor(DateTime day) {
+    final prefix = _dayKey(day);
+    return _tasks
+        .where((t) =>
+            t.scheduledStart != null &&
+            t.scheduledStart!.startsWith(prefix))
+        .toList()
+      ..sort((a, b) => a.scheduledStart!.compareTo(b.scheduledStart!));
+  }
+
+  Future<void> _completeTask(Task task) async {
+    try {
+      // Completing never reschedules: no device-calendar refresh needed.
+      final orchestrator = await widget.services.buildLocalOrchestrator();
+      await orchestrator.completeTask(task.id);
+    } on Exception catch (e) {
+      _showError('Could not complete: $e');
       return;
     }
-    setState(() => _busy = true);
+    DataReload.bump();
+  }
+
+  Future<void> _skipTask(Task task) async {
     try {
-      final orchestrator = await widget.services.orchestrator();
-      {
-        final result = await orchestrator.skipTask(task.id);
-        final start = result.task.scheduledStart;
+      // Skipping re-slots the task now: refresh device busy blocks first.
+      final orchestrator =
+          await widget.services.buildLocalOrchestrator(refreshBusyBlocks: true);
+      await orchestrator.skipTask(task.id);
+    } on Exception catch (e) {
+      _showError('Could not re-slot: $e');
+      return;
+    }
+    DataReload.bump();
+  }
+
+  /// Re-plan: LLM pass over all unfinished tasks. Non-blocking UX — a thin
+  /// progress bar shows while the call runs; the shell stays usable.
+  Future<void> _replan() async {
+    if (_replanning) return;
+    setState(() => _replanning = true);
+    try {
+      final orchestrator = await widget.services.buildLlmOrchestrator();
+      if (orchestrator == null) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                start == null
-                    ? "Couldn't fit — needs attention"
-                    : 'Moved to ${dayClock(context, DateTime.parse(start).toLocal())}',
-              ),
-            ),
-          );
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('Provider not configured — open Settings.'),
+          ));
         }
+        return;
       }
-    } catch (e) {
+      final result = await orchestrator.replan();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(providerErrorMessage(e, demoMode: false))),
+        final tips = result.tips.take(3).toList();
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Re-plan complete'),
+            content: tips.isEmpty
+                ? const Text('Your unfinished tasks were re-dated.')
+                : Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      for (final tip in tips)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Text(tip),
+                        ),
+                    ],
+                  ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
         );
       }
+    } on LlmProviderException catch (e) {
+      if (mounted) _showError(_providerErrorMessage(e));
+    } on Exception catch (e) {
+      if (mounted) _showError('Re-plan failed: $e');
     } finally {
-      await _reload();
-      if (mounted) setState(() => _busy = false);
+      if (mounted) setState(() => _replanning = false);
+      DataReload.bump();
     }
   }
 
-  Future<void> _replan() async {
-    if (!await confirmAction(context, 'Re-plan all unfinished tasks?') ||
-        !mounted) {
-      return;
+  static String _providerErrorMessage(LlmProviderException e) {
+    if (e is AuthError) return 'Auth failed — check API key in Settings.';
+    if (e is RateLimitError) {
+      return 'Rate limited — try again in a few minutes.';
     }
-    await Future.wait(_pendingDone.toList().map(_commit));
-    if (!mounted) return;
-    setState(() => _busy = true);
-    var demoMode = false;
-    try {
-      demoMode = await widget.services.config.getMode() == 'demo';
-      final before = {
-        for (final t in await widget.services.db.getAllTasks())
-          t.id: t.scheduledStart,
-      };
-      if (!mounted) return;
-      final result = await withProgress(
-        context,
-        () async =>
-            (await widget.services.orchestrator(needsProvider: true)).replan(),
-      );
-      await _reload();
-      if (!mounted) return;
-      await Navigator.of(context).push<void>(
-        MaterialPageRoute(
-          builder: (_) => ReplanResultScreen(
-            before: before,
-            result: result,
-            tasks: _tasks,
-            goals: _goals,
-          ),
-        ),
-      );
-    } catch (e) {
-      await _reload();
-      if (mounted) {
-        setState(() => _error = providerErrorMessage(e, demoMode: demoMode));
-        widget.onProviderError(e);
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
+    if (e is QuotaError) {
+      return 'Demo budget exhausted — add your own provider in Settings.';
     }
+    if (e is NetworkError) return 'Network error — check connection.';
+    return 'Provider error — try again.';
   }
 
-  Future<void> _openTask(Task task) async {
-    // Flush the undo window before showing an immutable completed session.
-    await _commit(task.id);
-    final current = await widget.services.db.getTask(task.id);
-    if (!mounted || current == null) return;
-    final message = await showTaskDetails(
-      context,
-      widget.services,
-      _goals.firstWhere((g) => g.id == task.goalId),
-      current,
-    );
-    await _reload();
-    if (mounted && message != null) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
-    }
-  }
-
-  Widget _taskRow(Task task) {
-    final completed =
-        task.status == TaskStatus.completed || _pendingDone.contains(task.id);
-    final pending = task.status == TaskStatus.pending && !completed;
-    final theme = Theme.of(context);
-    final now = DateTime.now();
-    final started = !now.isBefore(DateTime.parse(task.scheduledStart!));
-    final missed =
-        pending &&
-        task.scheduledEnd != null &&
-        !now.isBefore(DateTime.parse(task.scheduledEnd!));
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: Opacity(
-        opacity: completed ? 0.6 : 1,
-        child: Card(
-          child: InkWell(
-            onTap: _busy ? null : () => _openTask(task),
-            borderRadius: BorderRadius.circular(12),
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(minHeight: 64),
-                // Stretch so the time column top-aligns with the title while the
-                // trailing Done button stays centered.
-                child: IntrinsicHeight(
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      SizedBox(
-                        width: 84,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              clock(
-                                context,
-                                DateTime.parse(task.scheduledStart!).toLocal(),
-                              ),
-                              maxLines: 1,
-                              softWrap: false,
-                              style: theme.textTheme.titleSmall?.copyWith(
-                                color: completed
-                                    ? theme.colorScheme.onSurfaceVariant
-                                    : null,
-                              ),
-                            ),
-                            if (task.scheduledEnd != null)
-                              Text(
-                                clock(
-                                  context,
-                                  DateTime.parse(task.scheduledEnd!).toLocal(),
-                                ),
-                                maxLines: 1,
-                                softWrap: false,
-                                style: theme.textTheme.labelSmall?.copyWith(
-                                  color: theme.colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              task.title,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: theme.textTheme.bodyLarge?.copyWith(
-                                decoration: completed
-                                    ? TextDecoration.lineThrough
-                                    : null,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: Wrap(
-                                    spacing: 8,
-                                    runSpacing: 4,
-                                    crossAxisAlignment:
-                                        WrapCrossAlignment.center,
-                                    children: [
-                                      Text(
-                                        taskDuration(task.durationMinutes),
-                                        style: theme.textTheme.bodySmall
-                                            ?.copyWith(
-                                              color: theme
-                                                  .colorScheme
-                                                  .onSurfaceVariant,
-                                            ),
-                                      ),
-                                      if (task.adjusted)
-                                        const Tooltip(
-                                          message: 'Moved or shortened to fit your free time',
-                                          child: Pill(
-                                            'Moved to fit',
-                                            icon: Icons.swap_horiz,
-                                          ),
-                                        ),
-                                      if (missed)
-                                        Pill(
-                                          'Missed?',
-                                          color: theme.colorScheme.tertiary,
-                                        ),
-                                      if (task.skipCount > 0)
-                                        Pill('Skipped ${task.skipCount}×'),
-                                    ],
-                                  ),
-                                ),
-                                if (pending && started)
-                                  TextButton.icon(
-                                    style: TextButton.styleFrom(
-                                      minimumSize: const Size(48, 48),
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 4,
-                                      ),
-                                      textStyle: theme.textTheme.labelSmall,
-                                    ),
-                                    onPressed: _busy
-                                        ? null
-                                        : () => _taskAction(task, done: false),
-                                    icon: const Icon(Icons.redo, size: 16),
-                                    label: const Text("Didn't start"),
-                                  ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Center(
-                        child: SizedBox(
-                          width: 48,
-                          height: 48,
-                          child: completed
-                              ? Icon(
-                                  Icons.check_circle,
-                                  color: theme.colorScheme.primary,
-                                  semanticLabel: 'Completed',
-                                )
-                              : pending
-                              ? IconButton.filledTonal(
-                                  tooltip: 'Done',
-                                  onPressed: _busy
-                                      ? null
-                                      : () => _taskAction(task, done: true),
-                                  icon: const Icon(Icons.check),
-                                )
-                              : null,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _dayCell(DateTime day) {
-    final selected = DateUtils.isSameDay(_day, day);
-    final scheme = Theme.of(context).colorScheme;
-    final color = selected
-        ? scheme.onPrimary
-        : DateUtils.isSameDay(day, DateTime.now())
-        ? scheme.primary
-        : scheme.onSurfaceVariant;
-    final pending = _tasks.any(
-      (t) =>
-          t.status == TaskStatus.pending &&
-          t.scheduledStart != null &&
-          DateUtils.isSameDay(DateTime.parse(t.scheduledStart!).toLocal(), day),
-    );
-    return Expanded(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 2),
-        child: Semantics(
-          label: DateFormat('EEE d').format(day),
-          selected: selected,
-          button: true,
-          child: Material(
-            color: selected ? scheme.primary : scheme.surfaceContainerLow,
-            borderRadius: BorderRadius.circular(12),
-            child: InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: () => setState(() => _day = day),
-              child: ExcludeSemantics(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  child: Column(
-                    children: [
-                      Text(
-                        DateFormat('EEE').format(day),
-                        style: Theme.of(context).textTheme.labelSmall
-                            ?.copyWith(color: color),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '${day.day}',
-                        style: Theme.of(context).textTheme.titleMedium
-                            ?.copyWith(color: color),
-                      ),
-                      const SizedBox(height: 4),
-                      Container(
-                        width: 4,
-                        height: 4,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: pending ? color : Colors.transparent,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
   Widget build(BuildContext context) {
-    final today = DateUtils.dateOnly(DateTime.now());
-    final theme = Theme.of(context);
-    final attention = _tasks.where(
-      (t) => t.scheduledStart == null && t.status != TaskStatus.completed,
-    );
-    final dayTasks =
-        _tasks
-            .where(
-              (t) =>
-                  t.scheduledStart != null &&
-                  DateUtils.isSameDay(
-                    DateTime.parse(t.scheduledStart!).toLocal(),
-                    _day,
-                  ),
-            )
-            .toList()
-          ..sort(
-            (a, b) =>
-                DateTime.parse(a.scheduledStart!)
-                    .compareTo(DateTime.parse(b.scheduledStart!)),
-          );
-    final done = dayTasks
-        .where(
-          (t) =>
-              (t.status == TaskStatus.completed || _pendingDone.contains(t.id)),
-        )
-        .length;
-    final later =
-        _tasks
-            .where((t) => t.scheduledStart != null)
-            .map(
-              (t) => DateUtils.dateOnly(
-                DateTime.parse(t.scheduledStart!).toLocal(),
-              ),
-            )
-            .where(
-              (d) =>
-                  d.isAfter(_day) &&
-                  d.isBefore(
-                    today.add(const Duration(days: Orchestrator.horizonDays)),
-                  ),
-            )
-            .toList()
-          ..sort();
-    final next = later.firstOrNull;
-    final minutes = dayTasks.fold(0, (n, t) => n + t.durationMinutes);
+    final calendarError = widget.services.calendarError;
     return Scaffold(
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : ContentWidth(
-              child: RefreshIndicator(
-                onRefresh: _reload,
-                child: ListView(
-                  physics: const AlwaysScrollableScrollPhysics(),
-                  padding: const EdgeInsets.fromLTRB(20, 32, 20, 32),
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            DateUtils.isSameDay(_day, today)
-                                ? 'Today'
-                                : _day.difference(today).inDays == 1
-                                ? 'Tomorrow'
-                                : DateFormat('EEEE').format(_day),
-                            style: theme.textTheme.headlineMedium,
-                          ),
-                        ),
-                        if (_goals.isNotEmpty)
-                          FilledButton.tonalIcon(
-                            onPressed: _busy ? null : _replan,
-                            icon: const Icon(Icons.auto_awesome, size: 18),
-                            label: const Text('Re-plan'),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      // The weekday is already the title on other days.
-                      DateFormat(
-                        _day.difference(today).inDays > 1
-                            ? 'MMM d'
-                            : 'EEEE, MMM d',
-                      ).format(_day),
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    if (_goals.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        dayTasks.isEmpty
-                            ? 'Nothing scheduled'
-                            : '${dayTasks.length} tasks · ${taskDuration(minutes)} · $done done',
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                    if (dayTasks.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      LinearProgressIndicator(
-                        value: done / dayTasks.length,
-                        semanticsLabel:
-                            '$done of ${dayTasks.length} tasks done',
-                      ),
-                    ],
-                    const SizedBox(height: 24),
-                    if (_error != null) ...[
-                      Notice(_error!, error: true),
-                      const SizedBox(height: 16),
-                    ],
-                    if (_goals.isEmpty)
-                      EmptyState(
-                        Icons.flag_outlined,
-                        'Plan your first goal',
-                        'Tell Doer what you want to achieve. It breaks it into tasks and fits them into your week.',
-                        action: FilledButton(
-                          onPressed: widget.onAddGoal,
-                          child: const Text('Add a goal'),
-                        ),
-                      )
-                    else ...[
-                      Row(
-                        children: [
-                          for (var i = 0; i < Orchestrator.horizonDays; i++)
-                            _dayCell(
-                              DateTime(today.year, today.month, today.day + i),
-                            ),
-                        ],
-                      ),
-                      if (attention.isNotEmpty) ...[
-                        const SizedBox(height: 24),
-                        Card(
-                          color: theme.colorScheme.tertiaryContainer,
-                          child: ExpansionTile(
-                            shape: const Border(),
-                            collapsedShape: const Border(),
-                            leading: Icon(
-                              Icons.error_outline,
-                              color: theme.colorScheme.onTertiaryContainer,
-                            ),
-                            textColor: theme.colorScheme.onTertiaryContainer,
-                            collapsedTextColor:
-                                theme.colorScheme.onTertiaryContainer,
-                            title: Text(
-                              "${attention.length} ${attention.length == 1 ? 'task' : 'tasks'} couldn't fit this week",
-                              style: theme.textTheme.titleSmall,
-                            ),
-                            subtitle: const Text(
-                              'Re-plan or free up time in Settings.',
-                            ),
-                            children: [
-                              for (final task in attention)
-                                ListTile(
-                                  onTap: _busy ? null : () => _openTask(task),
-                                  title: Text(task.title),
-                                  subtitle: Text(
-                                    _goals
-                                        .firstWhere((g) => g.id == task.goalId)
-                                        .title,
-                                  ),
-                                ),
-                            ],
-                          ),
-                        ),
-                      ],
-                      if (dayTasks.isEmpty)
-                        const EmptyState(
-                          Icons.wb_sunny_outlined,
-                          'Nothing scheduled',
-                          'Pick another day, or re-plan to fill your week.',
-                        ),
-                      if (dayTasks.isEmpty && next != null)
-                        FilledButton.tonal(
-                          onPressed: () => setState(() => _day = next),
-                          child: Text(
-                            'Next: ${DateFormat('EEE d').format(next)} · ${later.where((d) => d == next).length} sessions',
-                          ),
-                        ),
-                      for (final goal in _goals)
-                        if (dayTasks.any((t) => t.goalId == goal.id)) ...[
-                          Padding(
-                            padding: const EdgeInsets.only(top: 24, bottom: 12),
-                            child: Row(
-                              children: [
-                                PriorityBadge(goal.priority, compact: true),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    goal.title,
-                                    style: theme.textTheme.titleSmall,
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  '${dayTasks.where((t) => t.goalId == goal.id && (t.status == TaskStatus.completed || _pendingDone.contains(t.id))).length}/${dayTasks.where((t) => t.goalId == goal.id).length}',
-                                  style: theme.textTheme.labelSmall?.copyWith(
-                                    color: theme.colorScheme.onSurfaceVariant,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          for (final task in dayTasks.where(
-                            (t) => t.goalId == goal.id,
-                          ))
-                            _taskRow(task),
-                        ],
-                    ],
-                  ],
-                ),
+      appBar: AppBar(
+        title: const Text('Doer'),
+        bottom: _replanning
+            ? const PreferredSize(
+                preferredSize: Size.fromHeight(4),
+                child: LinearProgressIndicator(minHeight: 4),
+              )
+            : null,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Provider settings',
+            onPressed: () async {
+              await openProviderSettings(context, widget.services);
+              DataReload.bump();
+            },
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          if (calendarError != null) _CalendarBanner(message: calendarError),
+          Expanded(
+            child: PageView.builder(
+              controller: _pageController,
+              itemCount: horizonDays,
+              itemBuilder: (context, index) {
+                final day = _dayFor(index);
+                final tasks = _tasksFor(day);
+                // Pending tasks the slotter could not place (SPEC §5.3:
+                // nothing ≥ 15-min floor) surface on today's page only.
+                final unscheduled = index == 0
+                    ? _tasks
+                        .where((t) =>
+                            t.scheduledStart == null &&
+                            t.status == TaskStatus.pending)
+                        .toList()
+                    : const <Task>[];
+                final prefix = _dayKey(day);
+                final dayBusy = _busy
+                    .where((b) =>
+                        b.start.toIso8601String().startsWith(prefix) ||
+                        b.end.toIso8601String().startsWith(prefix))
+                    .toList()
+                  ..sort((a, b) => a.start.compareTo(b.start));
+                return _DayPage(
+                  day: day,
+                  tasks: tasks,
+                  busyBlocks: dayBusy,
+                  unscheduledTasks: unscheduled,
+                  goalsById: _goalsById,
+                  isFirstDay: index == 0,
+                  onComplete: _completeTask,
+                  onSkip: _skipTask,
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _replanning ? null : _replan,
+        icon: _replanning
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.autorenew),
+        label: Text(_replanning ? 'Re-planning…' : 'Re-plan'),
+      ),
+    );
+  }
+}
+
+class _CalendarBanner extends StatelessWidget {
+  const _CalendarBanner({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Material(
+      color: colorScheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            Icon(Icons.warning_amber,
+                size: 18, color: colorScheme.onErrorContainer),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(message,
+                  style: TextStyle(color: colorScheme.onErrorContainer)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _DayPage extends StatelessWidget {
+  const _DayPage({
+    required this.day,
+    required this.tasks,
+    required this.busyBlocks,
+    required this.unscheduledTasks,
+    required this.goalsById,
+    required this.isFirstDay,
+    required this.onComplete,
+    required this.onSkip,
+  });
+
+  final DateTime day;
+  final List<Task> tasks;
+  final List<BusyBlock> busyBlocks;
+  final List<Task> unscheduledTasks;
+  final Map<String, Goal> goalsById;
+  final bool isFirstDay;
+  final Future<void> Function(Task) onComplete;
+  final Future<void> Function(Task) onSkip;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final weekday = DateFormat('EEEE').format(day);
+    final dateLabel = DateFormat('MMM d').format(day);
+    return ListView(
+      padding: const EdgeInsets.only(bottom: 96),
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          child: Text(
+            '$weekday · $dateLabel',
+            style: Theme.of(context)
+                .textTheme
+                .titleMedium
+                ?.copyWith(color: colorScheme.primary),
+          ),
+        ),
+        if (tasks.isEmpty && busyBlocks.isEmpty)
+          Padding(
+            padding: const EdgeInsets.all(32),
+            child: Center(
+              child: Text(
+                isFirstDay
+                    ? 'Nothing scheduled today.\nCreate a goal and tap Decompose.'
+                    : 'Nothing scheduled this day.',
+                textAlign: TextAlign.center,
+                style: Theme.of(context)
+                    .textTheme
+                    .bodyMedium
+                    ?.copyWith(color: colorScheme.outline),
               ),
             ),
+          ),
+        if (busyBlocks.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+            child: Text(
+              'Busy',
+              style: Theme.of(context)
+                  .textTheme
+                  .labelLarge
+                  ?.copyWith(color: colorScheme.outline),
+            ),
+          ),
+          for (final block in busyBlocks)
+            _BusyTile(block: block),
+        ],
+        for (final entry in _groupedByGoal().entries)
+          _GoalGroup(
+            goal: goalsById[entry.key],
+            tasks: entry.value,
+            onComplete: onComplete,
+            onSkip: onSkip,
+          ),
+        if (unscheduledTasks.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+            child: Text(
+              'Needs attention',
+              style: Theme.of(context)
+                  .textTheme
+                  .labelLarge
+                  ?.copyWith(color: colorScheme.error),
+            ),
+          ),
+          for (final task in unscheduledTasks)
+            _TaskTile(
+              task: task,
+              onComplete: () => onComplete(task),
+              onSkip: () => onSkip(task),
+            ),
+        ],
+      ],
+    );
+  }
+
+  /// Group by goal preserving the day's time order; goals keyed by id.
+  Map<String, List<Task>> _groupedByGoal() {
+    final byGoal = <String, List<Task>>{};
+    for (final task in tasks) {
+      byGoal.putIfAbsent(task.goalId, () => []).add(task);
+    }
+    return byGoal;
+  }
+}
+
+/// Read-only busy event from another calendar app. Shows the real event
+/// title when the block carries one; all-day expansions keep their
+/// source-only label.
+class _BusyTile extends StatelessWidget {
+  const _BusyTile({required this.block});
+
+  final BusyBlock block;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final start = DateFormat('HH:mm').format(block.start);
+    final end = DateFormat('HH:mm').format(block.end);
+    final label = block.title?.isNotEmpty == true
+        ? block.title!
+        : 'Busy (imported)';
+    return Opacity(
+      opacity: 0.75,
+      child: ListTile(
+        dense: true,
+        leading: Icon(Icons.event_busy, size: 20, color: colorScheme.outline),
+        title: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+        trailing: Text('$start-$end',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: colorScheme.outline)),
+      ),
+    );
+  }
+}
+
+class _GoalGroup extends StatelessWidget {
+  const _GoalGroup({
+    required this.goal,
+    required this.tasks,
+    required this.onComplete,
+    required this.onSkip,
+  });
+
+  final Goal? goal;
+  final List<Task> tasks;
+  final Future<void> Function(Task) onComplete;
+  final Future<void> Function(Task) onSkip;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+          child: Row(
+            children: [
+              Icon(Icons.flag, size: 16, color: colorScheme.primary),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  goal?.title ?? 'Unknown goal',
+                  style: Theme.of(context)
+                      .textTheme
+                      .labelLarge
+                      ?.copyWith(color: colorScheme.primary),
+                ),
+              ),
+            ],
+          ),
+        ),
+        for (final task in tasks)
+          _TaskTile(
+            task: task,
+            onComplete: () => onComplete(task),
+            onSkip: () => onSkip(task),
+          ),
+      ],
+    );
+  }
+}
+
+class _TaskTile extends StatelessWidget {
+  const _TaskTile({
+    required this.task,
+    required this.onComplete,
+    required this.onSkip,
+  });
+
+  final Task task;
+  final VoidCallback onComplete;
+  final VoidCallback onSkip;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final start = task.scheduledStart != null
+        ? DateFormat('HH:mm').format(DateTime.parse(task.scheduledStart!))
+        : null;
+    final end = task.scheduledEnd != null
+        ? DateFormat('HH:mm').format(DateTime.parse(task.scheduledEnd!))
+        : null;
+    final done = task.status == TaskStatus.completed;
+    final skipped = task.status == TaskStatus.skipped;
+    final unscheduled = task.scheduledStart == null;
+
+    return ListTile(
+      leading: start != null
+          ? SizedBox(
+              width: 48,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    start,
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          color: done || skipped
+                              ? colorScheme.outline
+                              : colorScheme.primary,
+                          decoration: done || skipped
+                              ? TextDecoration.lineThrough
+                              : null,
+                        ),
+                  ),
+                  if (end != null && end != start)
+                    Text(
+                      end,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: colorScheme.outline,
+                          ),
+                    ),
+                ],
+              ),
+            )
+          : null,
+      title: Text(
+        task.title,
+        style: TextStyle(
+          decoration: done || skipped ? TextDecoration.lineThrough : null,
+          color: done || skipped ? colorScheme.outline : null,
+        ),
+      ),
+      subtitle: (unscheduled || task.adjusted || task.skipCount > 0)
+          ? Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              children: [
+                if (unscheduled)
+                  _Marker(label: 'needs attention', color: colorScheme.error),
+                if (task.adjusted && !unscheduled)
+                  _Marker(label: 'adjusted', color: colorScheme.tertiary),
+                if (task.skipCount > 0)
+                  _Marker(
+                    label: 'skipped ×${task.skipCount}',
+                    color: colorScheme.secondary,
+                  ),
+              ],
+            )
+          : null,
+      trailing: done
+          ? Icon(Icons.check_circle, color: colorScheme.primary)
+          : Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  tooltip: 'Done',
+                  icon: const Icon(Icons.check),
+                  onPressed: onComplete,
+                ),
+                IconButton(
+                  tooltip: "Didn't Start",
+                  icon: const Icon(Icons.skip_next),
+                  onPressed: onSkip,
+                ),
+              ],
+            ),
+    );
+  }
+}
+
+class _Marker extends StatelessWidget {
+  const _Marker({required this.label, required this.color});
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        border: Border.all(color: color),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        label,
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(color: color),
+      ),
     );
   }
 }
