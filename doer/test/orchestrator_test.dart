@@ -195,6 +195,64 @@ void main() {
     await helper.close();
   });
 
+  for (final replan in [false, true]) {
+    test('${replan ? 'replan' : 'decompose'}: completed slots stay occupied', () async {
+      final helper = DatabaseHelper.forTest();
+      addTearDown(helper.close);
+      final today = DateTime.now();
+      var day = DateTime(today.year, today.month, today.day + 1);
+      while (day.weekday > DateTime.friday) {
+        day = day.add(const Duration(days: 1));
+      }
+      final date = day.toIso8601String().substring(0, 10);
+      final prefs = UserPreferences(timezone: 'UTC', bufferMinutes: 0);
+      await helper.upsertPreferences(prefs);
+      final activeGoal = Goal(
+        id: 'active-goal', title: 'Training', priority: GoalPriority.P1,
+        targetDate: date, createdAt: today.toIso8601String(),
+      );
+      await helper.insertGoal(activeGoal);
+      final completed = Task(
+        id: 'completed', goalId: activeGoal.id, title: 'Training baseline',
+        durationMinutes: 30, recommendedDay: date,
+        scheduledStart: day.add(const Duration(hours: 9)).toIso8601String(),
+        scheduledEnd: day.add(const Duration(hours: 9, minutes: 30)).toIso8601String(),
+        status: TaskStatus.completed, createdAt: today.toIso8601String(),
+      );
+      await helper.insertTasks([
+        completed,
+        if (replan) Task(
+          id: 'pending', goalId: activeGoal.id, title: 'Easy run',
+          durationMinutes: 45, recommendedDay: date,
+          createdAt: today.toIso8601String(),
+        ),
+      ]);
+      final provider = FakeProvider({
+        'tasks': [{
+          'task_id': 'pending', 'goal_id': activeGoal.id, 'title': 'Easy run',
+          'duration_minutes': 45, 'recommended_day': date,
+          'prerequisite_ids': <String>[],
+        }],
+      });
+      final orchestrator = Orchestrator(
+        db: helper, providerFactory: () => provider,
+        slotter: Slotter(prefs)
+          ..allGoals = {activeGoal.id: activeGoal}
+          ..allTasks = await helper.getAllTasks(),
+      );
+      final results = replan
+          ? (await orchestrator.replan()).placementResults
+          : await orchestrator.decompose(goals: [activeGoal]);
+      final placed = results.single.task;
+      expect(placed.scheduledStart, isNotNull);
+      expect(placed.scheduledStart!.substring(0, 10), date);
+      expect(DateTime.parse(placed.scheduledStart!),
+          DateTime.parse(completed.scheduledEnd!));
+      expect((await helper.getTask(completed.id))!.toMap(), completed.toMap());
+      expect(await helper.getBusyBlocksInRange(day, day.add(const Duration(days: 1))), isEmpty);
+    });
+  }
+
   test('decompose: empty task list fails after exactly one repair retry', () async {
     final helper = DatabaseHelper.forTest();
     await helper.insertGoal(goal('g-bad'));

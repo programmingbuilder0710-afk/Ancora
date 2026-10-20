@@ -414,6 +414,14 @@ class Slotter {
 
     final segments = <FreeSegment>[];
     DateTime cursor = workStart;
+    // Never schedule into time that has already passed today. Round up to the
+    // next 5 minutes so new sessions start on a readable time.
+    final now = DateTime.now();
+    if (day.year == now.year && day.month == now.month && day.day == now.day) {
+      final rounded = DateTime(now.year, now.month, now.day, now.hour,
+          (now.minute ~/ 5 + 1) * 5);
+      if (rounded.isAfter(cursor)) cursor = rounded;
+    }
 
     for (final interval in occupied) {
       final bufferedStart = interval.start.subtract(Duration(minutes: prefs.bufferMinutes));

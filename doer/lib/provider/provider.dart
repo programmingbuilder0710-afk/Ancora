@@ -1,4 +1,5 @@
 import 'dart:convert';
+
 import 'package:http/http.dart' as http;
 
 abstract class LlmProviderException implements Exception {
@@ -107,16 +108,21 @@ class OpenAiCompatibleProvider implements LlmProvider {
       attempt++;
       if (attempt > maxRateLimitRetries) {
         throw RateLimitError(
-            'Rate limit exceeded after $maxRateLimitRetries retries');
+          'Rate limit exceeded after $maxRateLimitRetries retries',
+        );
       }
       await Future<void>.delayed(backoff);
       backoff *= 2;
     }
 
     if (res.statusCode == 401 || res.statusCode == 403) {
-      throw AuthError('Authentication failed: Invalid API key or access denied');
+      throw AuthError(
+        'Authentication failed: Invalid API key or access denied',
+      );
     } else if (res.statusCode == 429) {
-      throw RateLimitError('Rate limit exceeded: Please wait or switch provider');
+      throw RateLimitError(
+        'Rate limit exceeded: Please wait or switch provider',
+      );
     } else if (res.statusCode == 402) {
       throw QuotaError('Quota exhausted: Check billing or switch provider');
     } else if (res.statusCode >= 500) {
@@ -130,7 +136,10 @@ class OpenAiCompatibleProvider implements LlmProvider {
       final content = json['choices'][0]['message']['content'];
       return jsonDecode(content) as Map<String, dynamic>;
     } catch (e) {
-      throw SchemaViolationError('Failed to parse response as JSON: $e', res.body);
+      throw SchemaViolationError(
+        'Failed to parse response as JSON: $e',
+        res.body,
+      );
     }
   }
 }
@@ -163,9 +172,12 @@ class DemoProvider extends OpenAiCompatibleProvider {
       );
     } on AuthError {
       throw QuotaError(
-          'Demo budget exhausted - add your own provider in Settings');
+        'Free planning is unavailable right now — add your own AI key in Settings.',
+      );
     } on QuotaError {
-      rethrow;
+      throw QuotaError(
+        'Free planning is unavailable right now — add your own AI key in Settings.',
+      );
     }
   }
 }

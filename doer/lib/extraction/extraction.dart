@@ -1,30 +1,43 @@
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:uuid/uuid.dart';
+
 import '../models/models.dart';
 
 class ExtractionService {
   static const int maxCharsPerDoc = 5000;
 
   Future<String> extractText(File file) async {
-    final extension = file.path.split('.').last.toLowerCase();
-
-    if (extension == 'txt' || extension == 'md') {
-      final raw = await file.readAsString();
-      return _truncate(raw);
+    if (![
+      'txt',
+      'md',
+      'pdf',
+      'docx',
+    ].contains(file.path.split('.').last.toLowerCase())) {
+      return extractTextFromBytes(file.path, const []);
     }
-
-    if (extension == 'pdf' || extension == 'docx') {
-      try {
-        final bytes = await file.readAsBytes();
-        final raw = utf8.decode(bytes, allowMalformed: true);
-        final printable = raw.replaceAll(RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]'), ' ');
-        return _truncate(printable);
-      } catch (_) {
+    try {
+      return await extractTextFromBytes(file.path, await file.readAsBytes());
+    } catch (_) {
+      if (['pdf', 'docx'].contains(file.path.split('.').last.toLowerCase())) {
         return '';
       }
+      rethrow;
     }
+  }
 
+  Future<String> extractTextFromBytes(String filename, List<int> bytes) async {
+    final extension = filename.split('.').last.toLowerCase();
+    if (extension == 'txt' || extension == 'md') {
+      return _truncate(utf8.decode(bytes));
+    }
+    if (extension == 'pdf' || extension == 'docx') {
+      final raw = utf8.decode(bytes, allowMalformed: true);
+      return _truncate(
+        raw.replaceAll(RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]'), ' '),
+      );
+    }
     return '';
   }
 
@@ -60,17 +73,20 @@ class ExtractionService {
         if (inEvent && dtStart != null) {
           final end = dtEnd ?? dtStart.add(const Duration(hours: 1));
           if (end.isAfter(dtStart)) {
-            final occurrences =
-                rrule != null ? _expandRrule(rrule, dtStart, end) : [dtStart];
+            final occurrences = rrule != null
+                ? _expandRrule(rrule, dtStart, end)
+                : [dtStart];
             for (final occ in occurrences) {
               final occEnd = occ.add(end.difference(dtStart));
               if (occEnd.isAfter(occ)) {
-                blocks.add(BusyBlock(
-                  id: uuid.v4(),
-                  source: sourceName,
-                  start: occ,
-                  end: occEnd,
-                ));
+                blocks.add(
+                  BusyBlock(
+                    id: uuid.v4(),
+                    source: sourceName,
+                    start: occ,
+                    end: occEnd,
+                  ),
+                );
               }
             }
           }
@@ -129,7 +145,13 @@ class ExtractionService {
     final byDay = <int>{}; // Dart weekdays: 1=Mon … 7=Sun
     if (parts['BYDAY'] != null && freq == 'WEEKLY') {
       const dayMap = {
-        'MO': 1, 'TU': 2, 'WE': 3, 'THU': 4, 'FR': 5, 'SA': 6, 'SU': 7,
+        'MO': 1,
+        'TU': 2,
+        'WE': 3,
+        'THU': 4,
+        'FR': 5,
+        'SA': 6,
+        'SU': 7,
       };
       for (final token in parts['BYDAY']!.split(',')) {
         final code = token.trim().toUpperCase();
@@ -147,17 +169,23 @@ class ExtractionService {
         // Phase weeks from dtStart's own week (Monday of that week), so
         // mid-week starts never emit days before dtStart and INTERVAL
         // phasing is anchored correctly.
-        final weekStartMonday = dtStart.subtract(Duration(days: dtStart.weekday - 1));
+        final weekStartMonday = dtStart.subtract(
+          Duration(days: dtStart.weekday - 1),
+        );
         final sortedDays = byDay.toList()..sort();
         var week = 0;
 
-        while (emitted < (count ?? maxOccurrences) && emitted < maxOccurrences) {
+        while (emitted < (count ?? maxOccurrences) &&
+            emitted < maxOccurrences) {
           final base = weekStartMonday.add(Duration(days: 7 * interval * week));
           // Once the whole week is past UNTIL, no later week can qualify —
           // terminates instead of spinning on skipped candidates.
           if (until != null && base.isAfter(until)) break;
           for (final weekday in sortedDays) {
-            if (emitted >= (count ?? maxOccurrences) || emitted >= maxOccurrences) break;
+            if (emitted >= (count ?? maxOccurrences) ||
+                emitted >= maxOccurrences) {
+              break;
+            }
             final candidate = base.add(Duration(days: weekday - 1));
             if (candidate.isBefore(dtStart)) continue; // never before dtStart
             if (until != null && candidate.isAfter(until)) continue;
@@ -183,8 +211,14 @@ class ExtractionService {
           current = current.add(Duration(days: 7 * interval));
           break;
         case 'MONTHLY':
-          current = DateTime(current.year, current.month + interval, current.day,
-              current.hour, current.minute, current.second);
+          current = DateTime(
+            current.year,
+            current.month + interval,
+            current.day,
+            current.hour,
+            current.minute,
+            current.second,
+          );
           break;
         default:
           return occurrences.isEmpty ? [dtStart] : occurrences;

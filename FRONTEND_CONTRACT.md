@@ -62,7 +62,7 @@ Orchestrator({
   required DatabaseHelper db,
   required LlmProvider Function() providerFactory,
   required Slotter slotter,
-  CalendarService? calendar,
+  PlanCalendar? calendar,
 })```
 
 - `providerFactory` is **synchronous and non-null**. `decompose()` calls it only after the non-empty input check; `replan()` calls it before database reads. `buildActiveProvider()` is async+nullable and NOT directly compatible — see §11.
@@ -106,7 +106,7 @@ class ReplanResult {
 Implementation details:
 - Matching unfinished task IDs are preserved; unknown response IDs receive temporary UUIDs during validation, then their update loop finds no existing match and does nothing. The validator therefore does not reject every unknown ID before the no-valid-task check.
 - Only matching rows are cleared/rebuilt. Model title, duration, recommended day, and prerequisites replace client values; goal ID, status, skip count, device ID, created time, and pinned deadline are restored. Pending tasks omitted by the model keep old scheduling fields but are still passed to Slotter.
-- Slotter receives only pending rows; skipped and completed tasks are not occupancy inputs. Null placements are not persisted. Calendar failures are swallowed and do not roll back database changes.
+- Slotter receives only pending rows to place; scheduled non-pending tasks overlapping the horizon are supplied as synthetic in-memory busy blocks in both decompose and replan. These blocks are not persisted. Null placements are not persisted. Calendar failures are swallowed and do not roll back database changes.
 - `tips` is cast/evaluated after database and calendar work. Wrong `tips` type can throw after mutation; element count is not locally enforced even though the request schema says at most three.
 
 **Throws:** typed provider errors, ordinary SQLite/plugin/cast/range errors, and potentially no-valid-task `Exception`. There is no task-not-found guard.
@@ -175,7 +175,7 @@ class Slotter {
 }
 ```
 
-`Slotter` is synchronous, persists nothing, and works on task copies. `allTasks` is **not** occupancy for `placeTasks`; only tasks in the `tasks` argument are occupied. `reSlotSkippedTask` uses its `currentTasks` argument for occupancy. Neither input list is automatically combined with `allTasks`.
+`Slotter` is synchronous, persists nothing, and works on task copies. `allTasks` is **not** occupancy for `placeTasks`; occupancy comes from `busyBlocks` and scheduled tasks in the `tasks` argument. `reSlotSkippedTask` uses its `currentTasks` argument for occupancy. Neither input list is automatically combined with `allTasks`.
 
 **Behavioral details:**
 - Work window is `preferences.workStart`–`workEnd` (model defaults 09:00–18:00); inactive weekdays have no segments. Malformed/out-of-range preference times or task dates propagate format/range errors.
@@ -421,7 +421,7 @@ class Task {
 }
 ```
 
-**Monotonic completion contract:** `status == completed` ⇒ completed tasks are never edited by `replan()`, `skipTask()`, or `completeTask()` again. `Slotter` freezes a non-pending task only when that task is included in its `tasks` argument and already has a schedule; `Orchestrator.decompose()`/`replan()` currently pass only pending tasks, so completed tasks inform LLM summaries but are not hard occupancy inputs to Slotter.
+**Monotonic completion contract:** `status == completed` ⇒ completed tasks are never edited by `replan()`, `skipTask()`, or `completeTask()` again. `Slotter` freezes a non-pending task only when that task is included in its `tasks` argument and already has a schedule; `Orchestrator.decompose()`/`replan()` pass pending tasks for placement and add scheduled non-pending tasks overlapping the horizon as synthetic in-memory busy blocks, so completed slots remain occupied.
 
 ### BusyBlock
 ```dart
@@ -454,7 +454,7 @@ class UserPreferences {
 | `DatabaseHelper` | Singleton per app (one file DB). `forTest()` → fresh `:memory:` per instance (`singleInstance: false`). Call `close()` on teardown (idempotent). |
 | `ProviderConfigService` | One instance per app. Call `await buildActiveProvider()` before constructing/caching a synchronous provider closure for `decompose`/`replan`; rebuild after settings changes. |
 | `CalendarService` | One instance. Normal flow calls `initialize()` after construction; Android permissions (`READ_CALENDAR`/`WRITE_CALENDAR`) are declared in the manifest. The constructor resolves `UserPreferences.timezone` into a stored `tz.Location`, syncs the package-global `tz.local` via `setLocalLocation`, exposes `resolvedTimezone`/`timeZone`/`timezoneWarning`, and falls back to UTC with a surfaced warning on `LocationNotFoundException`. Writes use the stored location without `initialize()`. |
-| `Slotter` | Public `allGoals`/`allTasks` registries exist for priority/deadline/prerequisite context, but **`doer/lib/` never assigns them**. Without caller hydration, priority and target-deadline lookup silently fall back and external prerequisite placements may be invisible. |
+| `Slotter` | Public `allGoals`/`allTasks` registries exist for priority/deadline/prerequisite context, hydrated by `AppServices.orchestrator()` before each operation. Without caller hydration, priority and target-deadline lookup silently fall back and external prerequisite placements may be invisible. |
 | `Orchestrator` | Short-lived per operation (or cached with a synchronous factory). Holds `db`, `slotter`, optional `calendar`. The factory is called only by `decompose`/`replan`; local operations do not need a working provider. |
 
 **Async pattern:** database, provider configuration/build, calendar, and Orchestrator methods are asynchronous; `Slotter` placement and ICS parsing are synchronous. UI must `await` asynchronous calls, handle typed provider errors (section 1), and refresh SQLite-backed lists after a successful mutation. There are no streams.
@@ -499,7 +499,7 @@ All should return ≥1 line each. `flutter analyze` must stay clean (this doc to
 
 ### Concrete production wiring today
 
-`main.dart` is still the Flutter counter demo and constructs **none** of these classes. The only production frontend source is `ProviderSettingsScreen` (not routed). A future composition root must own the full graph below. The only LLM-edge factory is `ProviderConfigService.buildActiveProvider()` → `DemoProvider` | `OpenAiCompatibleProvider` (`provider_config_service.dart:114-130`); nothing in `doer/lib` currently calls it.
+`main()` loads `AppServices` and opens `MyApp` / `AppShell`. `AppServices` owns the graph below and awaits `ProviderConfigService.buildActiveProvider()` for provider-backed operations. Settings routes to `ProviderSettingsScreen` after loading its initial values. See §13 for the UI API.
 
 ### Ownership & lifetime
 
@@ -600,7 +600,7 @@ Platform/timezone notes:
 
 ### Slotter registry effect on behavior (source-verified)
 
-`slotter.allGoals` / `slotter.allTasks` are public mutable fields (`slotter.dart:25-26`). **`doer/lib/` never assigns them** — only test files do. Caller responsibilities:
+`slotter.allGoals` / `slotter.allTasks` are public mutable fields (`slotter.dart:25-26`). `AppServices.orchestrator()` assigns them before every UI operation; the backend itself does not. Caller responsibilities:
 - `allGoals`: same-level priority and goal target-date ceiling. Hydrate with active + archived goals relevant to current/replanned work.
 - `allTasks`: external prerequisite calendar-day context only. It does not make completed/skipped tasks occupancy in `placeTasks`.
 - `reSlotSkippedTask` occupancy comes from its `currentTasks` argument, not `allTasks`.
@@ -618,7 +618,7 @@ CalendarService(this._planCalendarId, {this.preferences}); // REQUIRED positiona
 
 Caller must supply a `String?` position. A non-null value is a starting ID; `initialize()` overwrites it by finding "My Plan" or creating the calendar. `planCalendarId` throws only when the current field is null, so initialize is not required after a valid non-null constructor ID. `preferences` is optional; construction resolves the calendar timezone from `UserPreferences.timezone` (UTC when omitted).
 
-### `ProviderSettingsScreen` — concrete frontend screen (currently not routed)
+### `ProviderSettingsScreen` — concrete frontend screen (routed from Settings)
 
 ```dart
 ProviderSettingsScreen({
@@ -749,7 +749,7 @@ for (final tip in result.tips) showTip(tip);
 ```
 
 - No unfinished row returns empty after the factory ran, without an LLM call. Replan does not read documents.
-- Completed tasks are not occupancy inputs. Replan passes only `getTasksByStatus(pending)` to Slotter; completed/skipped scheduled tasks are also absent from `busyBlocks`, so completed slots do not constrain placement despite SPEC §5.1 wording.
+- Both decompose and replan preserve scheduled non-pending slots as occupancy (SPEC §5.1): the pre-plan task snapshot supplies synthetic busy blocks for intervals overlapping the horizon. These blocks are passed only to Slotter, never persisted or added to the LLM summary a second time.
 - The prompt asks the model to echo unfinished UUIDs. Matching returned IDs are preserved and rebuilt; omitted unfinished rows are left unchanged; unknown response IDs create temporary tasks but update no SQLite row. Returned skipped rows keep `skipped` and can therefore be cleared/persisted but excluded from the pending-only Slotter pass.
 - Matching rows are cleared and persisted one at a time. Null placements are not persisted; calendar changes are best-effort and not rolled back.
 - `tips` parsing happens after database/calendar work. Wrong type can throw after mutation; more than three elements are not locally rejected.
@@ -840,3 +840,167 @@ final count = await orchestrator.importIcsFile(path, stableSourceName);
 
 ---
 *Generated from `doer/lib/` source. Keep in sync with SPEC.md.*
+
+## 13. UI layer
+
+`AppServices` is loaded once; screens receive it by constructor. Tab switches recreate the visible screen and reload SQLite. `flutter_timezone` resolves the device/browser IANA zone for default preferences (UTC fallback).
+
+```dart
+// lib/app_services.dart
+static Future<AppServices> AppServices.load({DatabaseHelper? db,
+  ProviderConfigService? config, bool initCalendar = true});
+// Fields: final DatabaseHelper db; final ProviderConfigService config;
+// UserPreferences prefs; CalendarService? calendar; String? calendarError;
+// ConnectedCalendars? connected; String? lastSyncWarning;
+Future<Orchestrator> orchestrator({bool needsProvider = false});
+Future<void> reloadPrefs();
+Future<void> deleteGoal(Goal goal);
+Future<void> renameTask(Task task, String title);
+Future<void> deleteTask(Task task);
+Future<bool> usesBuiltInDemo();
+Future<bool> needsOnboarding();
+Future<void> finishOnboarding();
+const String freePlanningUnavailable = 'Free planning is unavailable right now — add your own AI key in Settings.';
+ProviderNotConfigured(); // implements Exception; final String message
+String providerErrorMessage(Object e, {required bool demoMode});
+bool isDemoExhausted(Object e, bool demoMode);
+
+// All widget constructors also accept Key? key.
+MyApp({required AppServices services});
+AppShell({required AppServices services});
+AgendaScreen({required AppServices services,
+  required void Function(Object) onProviderError, required VoidCallback onAddGoal,
+  DateTime? initialDay});
+GoalsScreen({required AppServices services, required void Function(Object) onProviderError,
+  void Function(DateTime?, String?)? onPlanned});
+GoalEditScreen({required AppServices services, Goal? goal,
+  required void Function(Object) onProviderError});
+SettingsScreen({required AppServices services});
+ReplanResultScreen({required Map<String, String?> before,
+  required ReplanResult result, required List<Task> tasks, required List<Goal> goals});
+
+// lib/ui/widgets.dart
+String clock(BuildContext context, DateTime time);
+String dayClock(BuildContext context, DateTime time);
+
+// lib/ui/task_details.dart
+Future<String?> showTaskDetails(BuildContext context, AppServices services,
+  Goal goal, Task task);
+
+// lib/ui/dialogs.dart
+Future<bool> confirmAction(BuildContext context, String message);
+Future<T> withProgress<T>(BuildContext context, Future<T> Function() action,
+  {String label = 'Planning your week…'});
+```
+
+
+```dart
+// lib/calendar/plan_calendar.dart (CalendarService implements PlanCalendar)
+abstract interface class PlanCalendar {
+  Future<Map<String, String>> atomicRewrite(List<PlacementResult> placementResults,
+    Map<String, String> existingDeviceIds);
+  Future<String> writeTaskEvent(Task task);
+  Future<void> deleteEvent(String deviceEventId);
+}
+// Orchestrator constructor: calendar parameter/field is now PlanCalendar?.
+
+// lib/calendar/connected_calendars.dart
+const apiBase = String.fromEnvironment('DOER_API_BASE');
+CalendarAccount({required String id, required String app, required String name});
+// final String id; final String app; final String name;
+ConnectedCalendars({required http.Client client, required DatabaseHelper db,
+  String baseUrl = apiBase});
+Future<String?> readKey(String key);
+Future<void> writeKey(String key, String? value);
+Future<String> userId();
+Future<Uri> connectUrl(String app);
+Future<List<CalendarAccount>> accounts();
+Future<void> disconnect(String accountId);
+Future<List<String>> icsUrls();
+Future<void> addIcsUrl(String url);
+Future<void> removeIcsUrl(String url);
+Future<String?> planAccountId();
+Future<void> setPlanAccountId(String? id);
+Future<String?> syncBusy(DatabaseHelper db);
+PipedreamPlanCalendar(ConnectedCalendars connected); // implements PlanCalendar
+// final ConnectedCalendars connected;
+Future<Map<String, String>> atomicRewrite(List<PlacementResult> placementResults,
+  Map<String, String> existingDeviceIds);
+Future<String> writeTaskEvent(Task task);
+Future<void> deleteEvent(String deviceEventId);
+
+// New APIs on existing classes
+Future<String> ExtractionService.extractTextFromBytes(String filename, List<int> bytes);
+Future<int> Orchestrator.importIcsContent(String content, String sourceName);
+```
+
+
+### UI presentation and shared components
+
+`MyApp` uses Material 3 with bundled Inter (`google_fonts`), teal seed light/dark themes,
+and `ThemeMode.system`. `AppShell` switches from bottom navigation to an extended
+rail at 840 logical pixels. Screen content is centered at a maximum width of 720.
+
+```dart
+// lib/ui/theme.dart
+ThemeData doerTheme(Brightness brightness);
+
+// lib/ui/widgets.dart — all widgets also accept Key? key
+PriorityBadge(GoalPriority priority, {bool compact = false});
+SectionHeader(String title, {Widget? trailing});
+EmptyState(IconData icon, String title, String message, {Widget? action});
+SectionCard({required List<Widget> children});
+Pill(String label, {IconData? icon, Color? color});
+ContentWidth({required Widget child});
+Notice(String message, {bool error = false});
+String taskDuration(int minutes);
+```
+
+Agenda groups day tasks by goal, summarizes completion, and expands unscheduled
+work in a needs-attention card. Done is optimistic for five seconds with Undo; completion becomes irreversible
+when the snackbar closes or the app hides/pauses or Agenda disposes. `GoalEditScreen` exposes the existing decomposition flow
+as “Plan tasks”, with sticky Save/Plan actions and archive/delete in its menu.
+
+Settings saves each valid schedule change immediately, preserving the plan
+calendar ID and reloading preferences. Invalid changes stay visible with an
+inline error and do not overwrite the last valid preferences. Only timezone
+saves show “Saved”. Calendar connections and ICS URL entry use a modal sheet;
+missing server connection configuration is informational and keeps link/file
+imports available. Provider settings retain their existing text and persistence
+contract. Re-plan results show counts, coaching tips, moved times and unfinished
+unscheduled tasks, with “Back to agenda” returning to the refreshed home screen.
+
+Agenda places Re-plan beside its title and hides Re-plan
+and the empty summary when no goals exist. Task cards retain time columns for
+completed rows, with a trailing completion indicator; pending rows use the Done
+icon button (tooltip `Done`); Didn't start appears once the start time passes,
+and Missed? appears after the end time. Schedule values
+share bodyLarge styling. Empty-state icons, the provider avatar and the Goals FAB
+use secondaryContainer colors. Unconfigured connect options remain disabled with
+`Not set up on this server` subtitles.
+
+```dart
+// lib/ui/onboarding_screen.dart
+OnboardingScreen({Key? key, required AppServices services,
+  required void Function(DateTime? day, String? message) onFinished});
+// lib/ui/schedule_fields.dart
+String? scheduleError(String start, String end, Set<String> days);
+WorkHours({Key? key, required String start, required String end,
+  bool enabled = true, required void Function(String, String) onChanged});
+ActiveDays({Key? key, required Set<String> days, bool enabled = true,
+  required ValueChanged<Set<String>> onChanged});
+static const List<String> ActiveDays.week = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+static const List<String> ActiveDays.names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+// lib/ui/calendar_connect.dart
+Future<void> showCalendarConnect(BuildContext context, AppServices services,
+  {bool notConfigured = false, bool initialLink = false});
+Future<void> connectCalendar(BuildContext context, AppServices services, String app);
+// lib/ui/provider_settings.dart
+Future<void> openProviderSettings(BuildContext context, AppServices services,
+  {bool ownKey = false});
+// lib/ui/tab_location.dart (conditional web/native implementation)
+void installTabRouting();
+int readTab();
+void writeTab(int tab);
+void Function() listenTab(void Function(int) changed);
+```
