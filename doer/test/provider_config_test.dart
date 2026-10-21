@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:doer/provider/provider_config_service.dart';
@@ -7,7 +6,7 @@ import 'package:doer/ui/settings/provider_settings_screen.dart';
 
 /// UI-wiring spy: records invocations, returns immediately. No DB, no
 /// secure storage, no real async - FakeAsync-safe. Persistence itself is
-/// proven by the headless service tests (provider_service_test.dart).
+/// proven by headless service tests.
 class SpyConfigService implements ProviderConfigService {
   final saved = <String>[];
   String mode = 'demo';
@@ -16,20 +15,12 @@ class SpyConfigService implements ProviderConfigService {
   Future<String> getMode() async => mode;
 
   @override
-  Future<({String apiKey, String baseUrl, String model})>
-  getDemoConfig() async => (
-    apiKey: 'demo-key',
-    baseUrl: 'https://demo.example.com/v1',
-    model: 'gpt-4o-mini',
-  );
+  Future<({String apiKey, String baseUrl, String model})> getDemoConfig() async =>
+      (apiKey: 'demo-key', baseUrl: 'https://demo.example.com/v1', model: 'gpt-4o-mini');
 
   @override
-  Future<({String apiKey, String baseUrl, String model})?>
-  getByokConfig() async => (
-    apiKey: 'byok-key',
-    baseUrl: 'https://byok.example.com/v1',
-    model: 'byok-model',
-  );
+  Future<({String apiKey, String baseUrl, String model})?> getByokConfig() async =>
+      (apiKey: 'byok-key', baseUrl: 'https://api.openai.com/v1', model: 'byok-model');
 
   @override
   Future<void> saveDemoConfig({
@@ -47,7 +38,7 @@ class SpyConfigService implements ProviderConfigService {
     required String model,
     String? baseUrl,
   }) async {
-    saved.add('byok:$preset|$baseUrl|$model|$apiKey');
+    saved.add('byok:$preset|$model|$apiKey');
   }
 
   @override
@@ -55,123 +46,82 @@ class SpyConfigService implements ProviderConfigService {
 }
 
 void main() {
-  GoogleFonts.config.allowRuntimeFetching = false;
-  testWidgets(
-    'BYOK flow: mode switch, custom preset reveals URL field, save captures inputs',
-    (tester) async {
-      final spy = SpyConfigService();
+  // Robust tap: ensure the target is on-screen and actually hit.
+  Future<void> tapVisible(WidgetTester tester, Finder finder) async {
+    await tester.ensureVisible(finder);
+    await tester.pumpAndSettle();
+    await tester.tap(finder, warnIfMissed: false);
+    await tester.pumpAndSettle();
+  }
 
-      await tester.pumpWidget(
-        MaterialApp(
-          home: ProviderSettingsScreen(
-            configService: spy,
-            initialMode: 'demo',
-            initialDemoApiKey: 'demo-key',
-            initialDemoBaseUrl: 'https://demo.example.com/v1',
-            initialDemoModel: 'gpt-4o-mini',
-            initialByokApiKey: 'byok-key',
-            initialByokBaseUrl: 'https://byok.example.com/v1',
-            initialByokModel: 'byok-model',
-          ),
-        ),
-      );
-      await tester.pumpAndSettle();
+  testWidgets('BYOK flow: mode switch, preset dropdown, save captures key+model',
+      (tester) async {
+    final spy = SpyConfigService();
 
-      // Switch to My provider mode -> BYOK save enabled, demo disabled.
-      await tester.tap(find.text('My provider'));
-      await tester.pumpAndSettle();
+    await tester.binding.setSurfaceSize(const Size(800, 2400));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(MaterialApp(
+      home: ProviderSettingsScreen(
+        configService: spy,
+        initialMode: 'demo',
+        initialByokApiKey: 'byok-key',
+        initialByokBaseUrl: 'https://api.openai.com/v1',
+        initialByokModel: 'byok-model',
+      ),
+    ));
+    await tester.pumpAndSettle();
 
-      // Scroll the BYOK section into view FIRST - lazy ListView builds the
-      // BYOK fields only when scrolled to.
-      final saveByok = find.text('Save my provider');
-      await tester.scrollUntilVisible(
-        saveByok,
-        200,
-        scrollable: find.byType(Scrollable).first,
-      );
+    // Switch to My provider mode -> BYOK save enabled, demo disabled.
+    await tester.tap(find.text('My provider'));
+    await tester.pumpAndSettle();
 
-      final urlFields = find.widgetWithText(TextField, 'Base URL');
-      final keyFields = find.widgetWithText(TextField, 'API key');
-      final modelFields = find.widgetWithText(TextField, 'Model name');
+    // No Base URL field exists for the user's provider: preset drives it.
+    final keyFields = find.widgetWithText(TextField, 'API key');
+    final modelFields = find.widgetWithText(TextField, 'Model name');
+    final saveByok = find.text('Save my provider');
 
-      await tester.enterText(urlFields.last, 'https://my-vllm.example.com/v1');
-      await tester.enterText(keyFields.last, 'sk-test-123');
-      await tester.enterText(modelFields.last, 'my-model');
-      await tester.tap(saveByok);
-      await tester.pumpAndSettle();
+    // Validation: empty key blocked, no service call.
+    await tester.enterText(keyFields.last, '');
+    await tapVisible(tester, saveByok);
+    expect(find.text('API key and model are required.'), findsOneWidget);
+    expect(spy.saved, isEmpty);
 
-      await tester.drag(find.byType(ListView), const Offset(0, 600));
-      await tester.pumpAndSettle();
+    // Valid save with a preset (openai detected from the seeded host).
+    await tester.enterText(keyFields.last, 'sk-test-123');
+    await tester.enterText(modelFields.last, 'my-model');
+    await tapVisible(tester, saveByok);
 
-      expect(find.text('Your provider saved and activated.'), findsOneWidget);
-      expect(
-        spy.saved,
-        contains(
-          'byok:custom|https://my-vllm.example.com/v1|my-model|sk-test-123',
-        ),
-      );
-    },
-  );
+    expect(find.text('Your provider saved and activated.'), findsOneWidget);
+    expect(spy.saved, contains('byok:openai|my-model|sk-test-123'));
+  });
 
-  testWidgets(
-    'demo save captures edited endpoint; validation blocks empty URL',
-    (tester) async {
-      final spy = SpyConfigService();
+  testWidgets('demo endpoint is fixed: card + activate, no editable fields', (tester) async {
+    final spy = SpyConfigService();
 
-      await tester.pumpWidget(
-        MaterialApp(
-          home: ProviderSettingsScreen(
-            configService: spy,
-            initialMode: 'demo',
-            initialDemoApiKey: 'demo-key',
-            initialDemoBaseUrl: 'https://demo.example.com/v1',
-            initialDemoModel: 'gpt-4o-mini',
-          ),
-        ),
-      );
-      await tester.pumpAndSettle();
+    await tester.binding.setSurfaceSize(const Size(800, 2400));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(MaterialApp(
+      home: ProviderSettingsScreen(
+        configService: spy,
+        initialMode: 'demo',
+      ),
+    ));
+    await tester.pumpAndSettle();
 
-      expect(find.text('https://demo.example.com/v1'), findsAtLeastNWidgets(1));
+    // Read-only endpoint card shows the built-in defaults.
+    expect(find.text(ProviderConfigService.defaultDemoBaseUrl), findsOneWidget);
+    expect(find.text(ProviderConfigService.defaultDemoModel), findsOneWidget);
 
-      final urlFields = find.widgetWithText(TextField, 'Base URL');
-      final modelFields = find.widgetWithText(TextField, 'Model name');
+    // No demo-editable fields exist.
+    expect(find.widgetWithText(TextField, 'Base URL'), findsNothing);
+    final saveDemo = find.text('Use demo endpoint');
+    await tapVisible(tester, saveDemo);
 
-      // Validation first: clear URL, save -> error status, no service call.
-      await tester.enterText(urlFields.first, '');
-      final saveDemo = find.text('Save demo endpoint');
-      await tester.scrollUntilVisible(
-        saveDemo,
-        200,
-        scrollable: find.byType(Scrollable).first,
-      );
-      await tester.tap(saveDemo);
-      await tester.pumpAndSettle();
-      await tester.drag(find.byType(ListView), const Offset(0, 600));
-      await tester.pumpAndSettle();
-      expect(find.text('Base URL and model are required.'), findsOneWidget);
-      expect(spy.saved, isEmpty);
-
-      // Now valid save.
-      await tester.enterText(
-        urlFields.first,
-        'https://new-demo.example.com/v1',
-      );
-      await tester.enterText(modelFields.first, 'demo-model-x');
-      await tester.scrollUntilVisible(
-        saveDemo,
-        200,
-        scrollable: find.byType(Scrollable).first,
-      );
-      await tester.tap(saveDemo);
-      await tester.pumpAndSettle();
-      await tester.drag(find.byType(ListView), const Offset(0, 600));
-      await tester.pumpAndSettle();
-
-      expect(find.text('Demo endpoint saved.'), findsOneWidget);
-      expect(
-        spy.saved,
-        contains('demo:https://new-demo.example.com/v1|demo-model-x|demo-key'),
-      );
-    },
-  );
+    expect(find.text('Demo endpoint activated.'), findsOneWidget);
+    // Activate persists exactly the built-in defaults.
+    expect(spy.saved, contains(
+        'demo:${ProviderConfigService.defaultDemoBaseUrl}'
+        '|${ProviderConfigService.defaultDemoModel}'
+        '|${ProviderConfigService.defaultDemoApiKey}'));
+  });
 }

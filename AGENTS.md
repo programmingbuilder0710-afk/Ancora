@@ -2,13 +2,13 @@
 
 ## Project Overview
 
-**Doer** (`doer/`, packaged as `com.doer.doer`) is an Android and web Flutter app that decomposes user goals into calendar-scheduled tasks via an OpenAI-compatible LLM (demo default: OpenRouter), places those tasks deterministically on-device, and writes them to the device calendar (Android) or a connected calendar (web). A Cloudflare Worker serves the web build and holds Pipedream Connect credentials for Google/Outlook connections and ICS subscriptions. Browser data stays in SQLite/IndexedDB. The LLM performs **semantics only** (task decomposition, `recommended_day`); all datetime math and placement is deterministic Dart.
+**Doer** (`doer/`, packaged as `com.doer.doer`) is an Android-only Flutter app that decomposes user goals into calendar-scheduled tasks via an OpenAI-compatible LLM (demo default: OpenRouter, or BYOK), places those tasks deterministically on-device, and writes them to the device calendar. The LLM performs **semantics only** (task decomposition, `recommended_day`); all datetime math and placement is deterministic Dart.
 
 Two authoritative docs exist at repo root:
 - `SPEC.md` — product/architecture spec (invariants, SQLite DDL, LLM schemas, slotter algorithm, degradation matrix)
 - `FRONTEND_CONTRACT.md` — generated companion documenting every implemented public API with exact signatures; **regenerate/update when `doer/lib/` changes**
 
-**Current state:** `main.dart` loads `AppServices` and opens the Agenda / Goals / Settings shell. The UI supports goal editing and documents, decomposition, local task actions, re-planning and results, provider setup, schedule preferences, and busy-calendar imports. Calendar initialization is optional; failures keep the local app usable.
+**Current state:** full UI implemented, all three SPEC 8.1 screens shipped. `doer/lib/main.dart` → `DoerApp` (`doer/lib/app.dart` — composition root: `AppServices`, `Bootstrap`, `HomeShell` 3-tab shell, `DataReload` ValueNotifier). Screens: `ui/agenda/agenda_screen.dart` (7-day pager, Done / Didn't Start, needs-attention section for unscheduled tasks, re-plan, error banners), `ui/goals/goals_screen.dart` (CRUD, priority, target date, doc attach, Decompose; goal delete also removes device events), `ui/settings/settings_screen.dart` (working hours, buffer, active days, timezone, .ics import, provider entry), `ui/settings/provider_settings_screen.dart` (demo + BYOK; BYOK limited to 4 fixed presets with no Base URL entry, routed via `openProviderSettings`). Device-calendar busy sync (`syncDeviceBusyBlocks`) + two-way plan reconcile run at init, on app resume (`BusySyncObserver`), and before decompose/re-plan/skip; synced events render in the agenda (Busy section) with real titles (`busy_blocks.title`, DB v2). External edits to "My Plan" events import back into their tasks and pin them (`tasks.user_edited`, DB v3) — decompose/re-plan never re-slot a user-moved task; external deletes clear the schedule (needs attention). `test/widget_test.dart` is now a real hermetic shell test (forTest + no-isolate FFI).
 
 ## Architecture & Data Flow
 
@@ -40,7 +40,7 @@ Key invariants:
 - **LLM does semantics only** — never placement math
 - **Monotonic completion** — `status == completed` tasks are never re-edited
 - **7-day horizon** — `Orchestrator.horizonDays = 7`; busy-block query `[today, today+7d)`
-- **LLM semantics stay separate from scheduling** — built-in demo calls use the Worker `/api/llm/chat/completions` proxy; custom demo and BYOK calls remain direct. The Worker holds OpenRouter/Pipedream secrets and proxies calendars/ICS; no server database.
+- **No backend/proxy** — Flutter calls the LLM provider directly (OpenAI-compatible; demo key or BYOK)
 
 ## Key Directories
 
@@ -52,14 +52,8 @@ Key invariants:
 | `doer/lib/extraction/` | `ExtractionService` — `.txt`/`.md`/`.pdf`/`.docx` text extraction (5000-char cap) + `.ics` parsing (366-occurrence cap) |
 | `doer/lib/slotter/` | `Slotter`, `PlacementResult`, `FreeSegment` — synchronous deterministic placement; public `allGoals`/`allTasks` registries must be hydrated by the caller |
 | `doer/lib/orchestration/` | `Orchestrator` — decompose/replan/skipTask/completeTask/importIcsFile; the only LLM callers |
-| `doer/lib/calendar/` | `PlanCalendar` interface, `ConnectedCalendars`/`PipedreamPlanCalendar` for Worker-backed sync; `CalendarService` — device_calendar writes to "My Plan"; timezone resolved at construction from `UserPreferences.timezone` |
-| `doer/lib/main.dart`, `doer/lib/app_services.dart` | Composition root, tab shell, hydrated orchestrators, calendar fallback, provider error messages |
-| `doer/lib/ui/agenda/` | Seven-day agenda, completion/skip actions, needs attention, re-plan entry point |
-| `doer/lib/ui/goals/` | Active goals and create/edit form, documents, decomposition, archive/delete |
-| `doer/lib/ui/settings/` | Schedule preferences, busy-calendar imports, and routed `ProviderSettingsScreen` |
-| `doer/lib/ui/replan/`, `doer/lib/ui/dialogs.dart` | Re-plan diff/tips and shared confirmation/progress dialogs |
-| `server/` | Cloudflare Worker: static assets, Pipedream Connect calendar API, ICS fetch, Vitest tests |
-| `doer/web/` | Flutter web shell and SQLite WASM/shared worker assets |
+| `doer/lib/calendar/` | `CalendarService` — device_calendar writes to "My Plan"; timezone resolved at construction from `UserPreferences.timezone` |
+| `doer/lib/ui/settings/` | `ProviderSettingsScreen` — provider config screen, pushed from agenda app bar |
 | `doer/test/` | hermetic + live test suites (see Testing below) |
 
 ## Development Commands
@@ -69,15 +63,6 @@ All commands run from `doer/`.
 ```bash
 # Run the app
 flutter run
-flutter run -d chrome
-flutter build web --release --base-href /app/
-
-# Worker (after building web)
-(cd ../server && npm install && npm run build && npx wrangler dev)
-(cd ../server && npx tsc --noEmit && npx vitest run)
-(cd ../server && npx wrangler deploy --dry-run)
-# Deployment, only when explicitly requested; configure secrets per server/README.md
-(cd ../server && npx wrangler deploy)
 
 # Static analysis (flutter_lints 6 defaults; excludes build/** and android/**)
 flutter analyze
@@ -91,9 +76,9 @@ flutter test test/slotter_test.dart
 flutter test test/calendar_timezone_test.dart
 
 # Hermetic suites only (no network)
-flutter test test/regression_test.dart test/file_input_test.dart test/provider_config_test.dart test/rrule_test.dart test/ui_test.dart
+flutter test test/regression_test.dart test/file_input_test.dart test/provider_config_test.dart test/rrule_test.dart test/widget_test.dart
 
-# Live tests (real OpenRouter endpoint, 4–10 min, require network)
+# Live tests (real endpoint via DOER_TEST_* --dart-defines, 4–10 min, require network)
 flutter test test/demo_live_test.dart
 flutter test test/live_logic_test.dart
 
@@ -127,7 +112,7 @@ final orchestrator = Orchestrator(
 
 **Test seams:**
 - `DatabaseHelper.forTest()` — fresh `:memory:` DB per instance
-- `ProviderConfigService.readKey`/`writeKey` — override via subclass (see `demo_live_test.dart:86-91`)
+- `ProviderConfigService.readKey`/`writeKey` — override via subclass (see `provider_config_test.dart`)
 - `Orchestrator.providerFactory: () => throw StateError('unreachable')` — valid for local-only operations (`skipTask`, `completeTask`, `importIcsFile` never call the factory)
 
 **Calendar timezone:** `CalendarService(planCalendarId, preferences: prefs)` resolves `UserPreferences.timezone` into a stored `tz.Location` at construction, calls `tz.setLocalLocation`, exposes `resolvedTimezone`/`timeZone`/`timezoneWarning`, and falls back to UTC with a surfaced warning on `LocationNotFoundException`. Writes use the stored `_location`.
@@ -141,11 +126,11 @@ final orchestrator = Orchestrator(
 | `doer/lib/orchestration/orchestrator.dart` | All LLM-calling entry points; task validation; placement flow |
 | `doer/lib/slotter/slotter.dart` | Deterministic placement; `FreeSegment`, `PlacementResult` |
 | `doer/lib/provider/provider.dart` | `LlmProvider`, `OpenAiCompatibleProvider`, `DemoProvider`, error taxonomy |
-| `doer/lib/provider/provider_config_service.dart` | Demo/BYOK config; embedded demo defaults (`qwen/qwen3.8-27b:free`) |
+| `doer/lib/provider/provider_config_service.dart` | Demo/BYOK config; BYOK limited to 4 fixed presets (no Custom/base-URL entry) |
 | `doer/lib/data/database_helper.dart` | SQLite schema, CRUD, FK enforcement, cascade delete |
 | `doer/lib/calendar/calendar_service.dart` | Device-calendar writes; "My Plan" find-or-create; timezone resolution |
 | `doer/lib/models/models.dart` | All data shapes; `UserPreferences.timezone` is IANA (e.g. `'America/Los_Angeles'`) |
-| `doer/lib/ui/settings/provider_settings_screen.dart` | Provider configuration screen; Settings loads initial values before routing |
+| `doer/lib/ui/settings/provider_settings_screen.dart` | Only frontend screen; caller must load initial values before construction |
 | `doer/pubspec.yaml` | Dependencies, SDK constraints |
 | `doer/analysis_options.yaml` | Lint config (flutter_lints 6, excludes build/android) |
 
@@ -154,11 +139,11 @@ final orchestrator = Orchestrator(
 ## Runtime/Tooling Preferences
 
 - **Runtime:** Flutter ≥3.44.0, Dart SDK ^3.13.4 (`pubspec.lock`)
-- **Platform:** Android + Flutter Web (SQLite WASM/IndexedDB). Android: `com.doer.doer`, Java 17, Kotlin 2.4.0 (`doer/android/app/build.gradle.kts`), Gradle 9.3.1 (`doer/android/gradle/wrapper/gradle-wrapper.properties`), AGP 9.1.0 (`doer/android/settings.gradle.kts`)
+- **Platform:** Android-only. `com.doer.doer`, Java 17, Kotlin 2.4.0 (`doer/android/app/build.gradle.kts`), Gradle 9.3.1 (`doer/android/gradle/wrapper/gradle-wrapper.properties`), AGP 9.1.0 (`doer/android/settings.gradle.kts`)
 - **Android permissions:** main manifest (`doer/android/app/src/main/AndroidManifest.xml`) declares `READ_CALENDAR` + `WRITE_CALENDAR` (required by `device_calendar`); normal Flutter debug/profile manifests add `INTERNET` for dev tooling
 - **Build output:** redirected to repo-root `build/` via `doer/android/build.gradle.kts`
 - **Release signing:** uses debug keys (no release signing configured — explicit TODO)
-- **Tooling:** use `flutter`/`dart` CLI from `doer/`; Worker npm scripts and Wrangler run from `server/`.
+- **No scripts/CI/Makefile/justfile** exist; use `flutter`/`dart` CLI directly from `doer/`
 - **`doer/README.md`** is stock Flutter boilerplate — ignore it; this document is the authoritative guide
 
 ## Testing & QA
@@ -173,25 +158,14 @@ final orchestrator = Orchestrator(
 - `test/file_input_test.dart` — `.ics` edge cases, extraction, storage integrity, slotter boundaries, 100-task stress
 - `test/calendar_timezone_test.dart` — constructor timezone resolution, UTC fallback, warning surfacing
 - `test/rrule_test.dart` — ICS recurrence expansion
-- `test/provider_config_test.dart` — BYOK/Demo settings screen
+- `test/provider_config_test.dart` — Demo/BYOK settings screen
 - `test/slotter_test.dart` — placement ordering, compression, stress
-- `test/ui_test.dart` — hermetic composition, agenda, goal editing, planning, and settings tests
+- `test/widget_test.dart` — app shell + goal-editor flow (hermetic)
 
-**Live suites** (real OpenRouter, 4–10 min, budget-hungry):
+**Live suites** (real endpoint via `DOER_TEST_API_KEY`/`DOER_TEST_BASE_URL`/`DOER_TEST_MODEL` `--dart-define`s, 4–10 min, budget-hungry):
 - `test/demo_live_test.dart` — end-to-end decompose
 - `test/live_logic_test.dart` — multi-scenario decompose/replan/skip/multi-goal audits
 
 **Known brittleness:** several suites hardcode `2026-09-28/29` fixtures against `DateTime.now()`; they fail once the clock passes that window. This needs a clock seam (injectable `now`) — do not rewrite fixture dates to mask it.
 
 **Expectations:** run `flutter analyze` and the relevant focused suite before handing off. Full-suite green is not currently achievable due to the clock-brittleness issue above.
-
-## Landing, onboarding, and demo planning
-
-- Onboarding and Settings share availability presets; pending-session actions depend on start/end time, and session details support rename/delete.
-
-- `/` serves `server/landing/`; `/app/` serves Flutter built with `--base-href /app/`.
-- `npm run build` in `server/` assembles `dist/` from landing assets and `doer/build/web`; it does not run Flutter.
-- First-run onboarding persists `onboarding_done` in secure storage; existing goals bypass it.
-- Demo proxy secret: `OPENROUTER_API_KEY`; vars: `DEMO_MODEL`, `DEMO_UPSTREAM`. Set an OpenRouter dashboard spend limit before enabling it.
-- UUID v4 bearer identity and rate bindings limit demo requests to 6/user and 20/IP per minute per Cloudflare location.
-- E2E: install `e2e/` dependencies, build Flutter, then `node e2e/run.mjs` from root. Local mock credentials are isolated in `e2e/.dev.vars.e2e`.

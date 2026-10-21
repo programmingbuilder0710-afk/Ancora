@@ -1,558 +1,322 @@
-import 'dart:convert';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 
-import '../calendar_connect.dart';
-import '../schedule_fields.dart';
-import '../provider_settings.dart';
-
-import '../../calendar/connected_calendars.dart';
-import '../dialogs.dart';
-import '../widgets.dart';
-
-import '../../app_services.dart';
+import '../../app.dart';
 import '../../models/models.dart';
 
+/// Settings screen (SPEC 8.1 #3): working hours, buffer minutes, active
+/// days, timezone display, `.ics` busy-calendar import, and the provider
+/// configuration entry point.
+///
+/// Every control persists immediately via `AppServices.updatePreferences`
+/// (SQLite singleton row). Working-hours/buffer/active-day changes take
+/// effect on the next decompose/re-plan/skip because AppServices hydrates
+/// the Slotter fresh from preferences before every mutating action.
 class SettingsScreen extends StatefulWidget {
-  final AppServices services;
   const SettingsScreen({super.key, required this.services});
+
+  final AppServices services;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  List<CalendarAccount> _accounts = [];
-  List<String> _icsUrls = [];
-  String? _planAccount;
-  late final AppLifecycleListener _lifecycle;
-  final _timezone = TextEditingController();
-  late String _start;
-  late String _end;
-  late int _buffer;
-  late Set<String> _days;
-  String _provider = 'Loading…';
-  String _model = '';
-  String? _scheduleError;
-  bool _saving = false;
-  bool _notConfigured = false;
-  Map<String, int> _sources = {};
-  String? _error;
-  bool _busy = false;
-  static const _notConfiguredMessage =
-      'Calendar connections are not configured on this server';
-  static const _week = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+  static const _dayKeys = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+  static const _dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+  UserPreferences? _prefs;
+  double? _bufferPreview; // local drag preview; persisted only on release
+  Map<String, int> _busySources = {}; // source filename -> block count
 
   @override
   void initState() {
     super.initState();
-    final prefs = widget.services.prefs;
-    _start = prefs.workStart;
-    _end = prefs.workEnd;
-    _buffer = prefs.bufferMinutes;
-    _days = prefs.activeDays.toSet();
-    _timezone.text = prefs.timezone;
-    _lifecycle = AppLifecycleListener(
-      onResume: () {
-        if (mounted && widget.services.connected != null) _run(_reload);
-      },
-    );
-    _run(_reload);
-  }
-
-  @override
-  void dispose() {
-    _lifecycle.dispose();
-    _timezone.dispose();
-    super.dispose();
+    _reload();
   }
 
   Future<void> _reload() async {
-    final config = widget.services.config;
-    final mode = await config.getMode();
-    final builtIn = await widget.services.usesBuiltInDemo();
-    final model = mode == 'demo'
-        ? (await config.getDemoConfig()).model
-        : (await config.getByokConfig())?.model ?? 'Setup incomplete';
-    final blocks = await widget.services.db.getBusyBlocksInRange(
-      DateTime(2000),
-      DateTime(2100),
-    );
-    final sources = <String, int>{};
-    for (final block in blocks) {
-      sources.update(block.source, (n) => n + 1, ifAbsent: () => 1);
-    }
-    final connected = widget.services.connected;
-    List<CalendarAccount> accounts = _accounts;
-    List<String> urls = _icsUrls;
-    String? target = _planAccount;
-    String? error;
-    if (connected != null) {
-      urls = await connected.icsUrls();
-      target = await connected.planAccountId();
-      try {
-        accounts = await connected.accounts();
-      } catch (e) {
-        error = e.toString().replaceFirst(RegExp(r'^Exception: '), '');
-      }
-    }
-    if (mounted) {
-      setState(() {
-        _accounts = accounts;
-        _icsUrls = urls;
-        _planAccount = target;
-        _notConfigured = error == _notConfiguredMessage;
-        _error =
-            (_notConfigured ? null : error) ??
-            (kIsWeb && Uri.base.queryParameters.containsKey('connect_error')
-                ? 'Calendar connection did not finish. Try connecting again.'
-                : null);
-        _provider = builtIn
-            ? 'Free (built-in)'
-            : mode == 'demo'
-            ? 'Demo (free, limited)'
-            : 'Your provider';
-        _model = builtIn ? 'Shared quota — add your own key anytime' : model;
-        _sources = sources;
-      });
-    }
-  }
-
-  Future<void> _run(Future<void> Function() action) async {
-    if (_busy) return;
+    final prefs = await widget.services.db.getPreferences();
+    final now = DateTime.now();
+    final blocks = await widget.services.db
+        .getBusyBlocksInRange(now, now.add(const Duration(days: 366)));
+    if (!mounted) return;
     setState(() {
-      _busy = true;
-      _error = null;
+      _prefs = prefs;
+      final sources = <String, int>{};
+      for (final block in blocks) {
+        sources[block.source] = (sources[block.source] ?? 0) + 1;
+      }
+      _busySources = sources;
     });
-    try {
-      await action();
-    } catch (e) {
-      if (mounted) {
-        final message = e.toString().replaceFirst(RegExp(r'^Exception: '), '');
-        setState(() {
-          if (message == _notConfiguredMessage) {
-            _notConfigured = true;
-          } else {
-            _error = message;
-          }
-        });
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
   }
 
-  void _message(String message) {
-    if (mounted) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
-    }
+  Future<void> _update(UserPreferences prefs) async {
+    await widget.services.updatePreferences(prefs);
+    if (mounted) setState(() => _prefs = prefs);
   }
 
-  Future<void> _openProvider() async {
-    await openProviderSettings(context, widget.services);
-    await _reload();
-  }
-
-  Future<bool> _save() async {
-    setState(() {
-      _saving = true;
-      _scheduleError = null;
-    });
-    try {
-      final error = scheduleError(_start, _end, _days);
-      if (error != null) throw Exception(error);
-      if (_timezone.text.trim().isEmpty) {
-        throw Exception('Enter an IANA timezone.');
-      }
-      await widget.services.db.upsertPreferences(
-        UserPreferences(
-          workStart: _start,
-          workEnd: _end,
-          bufferMinutes: _buffer,
-          activeDays: _week.where(_days.contains).toList(),
-          timezone: _timezone.text.trim(),
-          planCalendarId: widget.services.prefs.planCalendarId,
-        ),
-      );
-      await widget.services.reloadPrefs();
-      return true;
-    } catch (e) {
-      if (mounted) {
-        setState(
-          () => _scheduleError = e.toString().replaceFirst(
-            RegExp(r'^Exception: '),
-            '',
-          ),
-        );
-      }
-      return false;
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
-  Future<void> _editTimezone() async {
-    final previous = _timezone.text;
-    var saving = false;
-    String? error;
-    final saved = await showDialog<bool>(
+  Future<void> _pickTime({required bool isStart}) async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    final current = isStart ? prefs.workStart : prefs.workEnd;
+    final parts = current.split(':');
+    final picked = await showTimePicker(
       context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, update) => AlertDialog(
-          title: const Text('Timezone'),
-          content: TextField(
-            controller: _timezone,
-            enabled: !saving,
-            decoration: InputDecoration(
-              labelText: 'Timezone (IANA)',
-              hintText: 'America/Los_Angeles',
-              errorText: error,
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: saving
-                  ? null
-                  : () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: saving
-                  ? null
-                  : () async {
-                      update(() => saving = true);
-                      final success = await _save();
-                      if (!dialogContext.mounted) return;
-                      if (success) {
-                        Navigator.pop(dialogContext, true);
-                      } else {
-                        update(() {
-                          saving = false;
-                          error = _scheduleError;
-                        });
-                      }
-                    },
-              child: const Text('Save'),
-            ),
-          ],
-        ),
-      ),
+      initialTime: TimeOfDay(
+          hour: int.parse(parts[0]), minute: int.parse(parts[1])),
     );
-    if (saved == true) {
-      _message('Saved');
-    } else {
-      if (mounted) {
-        setState(() {
-          _timezone.text = previous;
-          if (_scheduleError == 'Enter an IANA timezone.') {
-            _scheduleError = null;
-          }
-        });
-      }
+    if (picked == null) return;
+    final value =
+        '${picked.hour.toString().padLeft(2, '0')}:${picked.minute.toString().padLeft(2, '0')}';
+    final newMinutes = _startMinutes(value);
+    if (isStart && newMinutes >= _startMinutes(prefs.workEnd)) {
+      _showError('Work start must be before work end.');
+      return;
     }
+    if (!isStart && newMinutes <= _startMinutes(prefs.workStart)) {
+      _showError('Work end must be after work start.');
+      return;
+    }
+    await _update(isStart
+        ? _copy(prefs, workStart: value)
+        : _copy(prefs, workEnd: value));
   }
 
-  Future<void> _import() async {
-    final picked = await FilePicker.platform.pickFiles(
-      withData: true,
+  static int _startMinutes(String hhmm) {
+    final parts = hhmm.split(':');
+    return int.parse(parts[0]) * 60 + int.parse(parts[1]);
+  }
+
+
+  UserPreferences _copy(UserPreferences prefs,
+      {String? workStart, String? workEnd, int? bufferMinutes}) {
+    return UserPreferences(
+      workStart: workStart ?? prefs.workStart,
+      workEnd: workEnd ?? prefs.workEnd,
+      bufferMinutes: bufferMinutes ?? prefs.bufferMinutes,
+      activeDays: prefs.activeDays,
+      timezone: prefs.timezone,
+      planCalendarId: prefs.planCalendarId,
+    );
+  }
+
+  Future<void> _toggleDay(String day) async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    final days = [...prefs.activeDays];
+    final active = days.contains(day);
+    if (active) {
+      days.remove(day);
+    } else {
+      days.add(day);
+    }
+    if (days.isEmpty) {
+      _showError('At least one active day is required.');
+      return;
+    }
+    await _update(UserPreferences(
+      workStart: prefs.workStart,
+      workEnd: prefs.workEnd,
+      bufferMinutes: prefs.bufferMinutes,
+      activeDays: days,
+      timezone: prefs.timezone,
+      planCalendarId: prefs.planCalendarId,
+    ));
+  }
+
+  Future<void> _setBuffer(double value) async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    await _update(_copy(prefs, bufferMinutes: value.round()));
+  }
+
+  /// `.ics` import (SPEC 7.2): parse VEVENTs into busy blocks, replacing
+  /// any previously imported blocks from the same file. Local-only.
+  Future<void> _importIcs() async {
+    final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['ics'],
     );
-    if (picked == null) return;
-    final file = picked.files.single;
-    if (file.bytes == null) throw Exception('Could not open ${file.name}');
+    if (result == null) return;
+    final path = result.files.single.path;
+    if (path == null) return;
+    final name = result.files.single.name;
     try {
-      final count = await (await widget.services.orchestrator())
-          .importIcsContent(utf8.decode(file.bytes!), file.name);
-      _message('Imported $count busy periods from ${file.name}');
-    } finally {
+      final orchestrator = await widget.services.buildLocalOrchestrator();
+      final count = await orchestrator.importIcsFile(path, name);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(count == 0
+            ? 'No calendar events found in "$name".'
+            : 'Imported $count busy block${count == 1 ? '' : 's'} from "$name".'),
+      ));
       await _reload();
+    } on Exception catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Import failed: $e')));
+      }
     }
   }
 
-  Future<void> _showConnect() async {
-    await showCalendarConnect(
-      context,
-      widget.services,
-      notConfigured: _notConfigured,
-    );
-    await _run(_reload);
-  }
-
-  String _sourceName(String source) {
-    if (source.startsWith('ics:')) return source.substring(4);
-    if (!source.startsWith('pd:')) return source;
-    final parts = source.split(':');
-    if (parts.length < 3) return source;
-    final id = parts.skip(2).join(':');
-    return '$id · ${parts[1] == 'google_calendar' ? 'Google Calendar' : 'Outlook'}';
-  }
-
-  Widget _accountTile(CalendarAccount account) => ListTile(
-    leading: CircleAvatar(
-      child: Text(account.app == 'google_calendar' ? 'G' : 'O'),
-    ),
-    title: Text(account.name),
-    subtitle: Text(
-      '${account.app == 'google_calendar' ? 'Google Calendar' : 'Outlook'}${_planAccount == account.id ? ' · Plan goes here' : ''}',
-    ),
-    trailing: PopupMenuButton<String>(
-      tooltip: 'Calendar actions',
-      enabled: !_busy,
-      onSelected: (value) => _run(() async {
-        if (value == 'plan') {
-          await widget.services.connected!.setPlanAccountId(
-            _planAccount == account.id ? null : account.id,
-          );
-        } else {
-          if (!await confirmAction(context, 'Disconnect ${account.name}?')) {
-            return;
-          }
-          await widget.services.connected!.disconnect(account.id);
-        }
-        await _reload();
-      }),
-      itemBuilder: (_) => [
-        if (kIsWeb)
-          CheckedPopupMenuItem(
-            value: 'plan',
-            checked: _planAccount == account.id,
-            child: const Text('Write my plan here'),
+  Future<void> _deleteSource(String source) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Remove "$source"?'),
+        content:
+            const Text('All busy blocks imported from this file are deleted.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
           ),
-        const PopupMenuItem(value: 'disconnect', child: Text('Disconnect')),
-      ],
-    ),
-  );
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await widget.services.db.deleteBusyBlocksBySource(source);
+    await _reload();
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final valueStyle = theme.textTheme.bodyLarge?.copyWith(
-      color: theme.colorScheme.onSurfaceVariant,
-      fontWeight: FontWeight.w400,
-    );
-    final scheduleEnabled = !_saving && !_busy;
+    final prefs = _prefs;
+    final colorScheme = Theme.of(context).colorScheme;
+    if (prefs == null) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+    final timezoneWarning = widget.services.calendar?.timezoneWarning;
     return Scaffold(
-      appBar: AppBar(toolbarHeight: 24),
-      body: ContentWidth(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
-          children: [
-            Text('Settings', style: theme.textTheme.headlineMedium),
-            if (_error != null) ...[
-              const SizedBox(height: 16),
-              Notice(_error!, error: true),
-            ],
-            const SectionHeader('AI provider'),
-            SectionCard(
+      appBar: AppBar(title: const Text('Settings')),
+      body: ListView(
+        padding: const EdgeInsets.only(bottom: 32),
+        children: [
+          _section('Working hours'),
+          ListTile(
+            leading: const Icon(Icons.schedule),
+            title: const Text('Work start'),
+            trailing: Text(prefs.workStart,
+                style: Theme.of(context).textTheme.titleMedium),
+            onTap: () => _pickTime(isStart: true),
+          ),
+          ListTile(
+            leading: const Icon(Icons.schedule),
+            title: const Text('Work end'),
+            trailing: Text(prefs.workEnd,
+                style: Theme.of(context).textTheme.titleMedium),
+            onTap: () => _pickTime(isStart: false),
+          ),
+          _section('Buffer between events'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
               children: [
-                ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor: theme.colorScheme.secondaryContainer,
-                    child: Icon(
-                      Icons.auto_awesome,
-                      color: theme.colorScheme.onSecondaryContainer,
-                    ),
+                Expanded(
+                  child: Slider(
+                    value: _bufferPreview ?? prefs.bufferMinutes.toDouble(),
+                    min: 0,
+                    max: 60,
+                    divisions: 12,
+                    label:
+                        '${(_bufferPreview ?? prefs.bufferMinutes).round()} min',
+                    onChanged: (v) => setState(() => _bufferPreview = v),
+                    onChangeEnd: (v) {
+                      setState(() => _bufferPreview = null);
+                      _setBuffer(v);
+                    },
                   ),
-                  title: Text(_provider),
-                  subtitle: Text(_model),
-                  trailing: const Icon(Icons.chevron_right),
-                  onTap: _busy ? null : () => _run(_openProvider),
+                ),
+                SizedBox(
+                  width: 56,
+                  child: Text('${(_bufferPreview ?? prefs.bufferMinutes).round()} min',
+                      textAlign: TextAlign.end,
+                      style: Theme.of(context).textTheme.titleSmall),
                 ),
               ],
             ),
-            const SectionHeader('When Doer can schedule'),
-            SectionCard(
+          ),
+          _section('Active days'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Wrap(
+              spacing: 8,
               children: [
-                WorkHours(
-                  start: _start,
-                  end: _end,
-                  enabled: scheduleEnabled,
-                  onChanged: (start, end) {
-                    setState(() {
-                      _start = start;
-                      _end = end;
-                    });
-                    _save();
-                  },
-                ),
-                ListTile(
-                  title: const Text('Buffer between tasks'),
-                  trailing: DropdownButton<int>(
-                    value: _buffer,
-                    style: valueStyle,
-                    underline: const SizedBox.shrink(),
-                    items: [
-                      for (final value in {
-                        ...[0, 5, 10, 15, 30],
-                        _buffer,
-                      }.toList()..sort())
-                        DropdownMenuItem(
-                          value: value,
-                          child: Text('$value min'),
-                        ),
-                    ],
-                    onChanged: scheduleEnabled
-                        ? (value) {
-                            setState(() => _buffer = value!);
-                            _save();
-                          }
-                        : null,
-                  ),
-                ),
-                ActiveDays(
-                  days: _days,
-                  enabled: scheduleEnabled,
-                  onChanged: (days) {
-                    setState(() => _days = days);
-                    _save();
-                  },
-                ),
-                ListTile(
-                  title: const Text('Timezone'),
-                  trailing: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 200),
-                    child: Tooltip(
-                      message: _timezone.text,
-                      child: Text(
-                        _timezone.text,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: valueStyle,
-                      ),
-                    ),
-                  ),
-                  onTap: scheduleEnabled ? _editTimezone : null,
-                ),
-              ],
-            ),
-            if (_scheduleError != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Notice(_scheduleError!, error: true),
-              ),
-            if (widget.services.calendar?.timezoneWarning != null)
-              Notice(widget.services.calendar!.timezoneWarning!),
-            if (widget.services.calendarError != null) ...[
-              const SizedBox(height: 24),
-              Notice(widget.services.calendarError!),
-            ],
-            if (widget.services.connected != null) ...[
-              SectionHeader(
-                'Calendars',
-                trailing: _busy
-                    ? const SizedBox(
-                        width: 48,
-                        height: 48,
-                        child: Center(
-                          child: SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          ),
-                        ),
-                      )
-                    : IconButton(
-                        tooltip: 'Sync now',
-                        icon: const Icon(Icons.sync),
-                        onPressed: () => _run(() async {
-                          final warning = await widget.services.connected!
-                              .syncBusy(widget.services.db);
-                          widget.services.lastSyncWarning = warning;
-                          await _reload();
-                          _message(warning ?? 'Calendars synced');
-                        }),
-                      ),
-              ),
-              SectionCard(
-                children: [
-                  if (_notConfigured)
-                    const ListTile(
-                      leading: Icon(Icons.info_outline),
-                      title: Text(
-                        "Calendar connections aren't set up on this server.",
-                      ),
-                    ),
-                  for (final account in _accounts) _accountTile(account),
-                  ListTile(
-                    leading: const Icon(Icons.add_link),
-                    title: const Text('Connect a calendar'),
-                    trailing: const Icon(Icons.chevron_right),
-                    onTap: _busy ? null : _showConnect,
-                  ),
-                  for (final url in _icsUrls)
-                    ListTile(
-                      leading: const Icon(Icons.link),
-                      title: Text(Uri.parse(url).host),
-                      subtitle: Text(
-                        url,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      trailing: IconButton(
-                        tooltip: 'Remove subscription',
-                        icon: const Icon(Icons.delete_outline),
-                        onPressed: _busy
-                            ? null
-                            : () => _run(() async {
-                                await widget.services.connected!.removeIcsUrl(
-                                  url,
-                                );
-                                await _reload();
-                              }),
-                      ),
-                    ),
-                  if (widget.services.lastSyncWarning != null)
-                    ListTile(
-                      leading: const Icon(Icons.warning_amber_rounded),
-                      title: Text(
-                        widget.services.lastSyncWarning!,
-                        style: theme.textTheme.bodySmall,
-                      ),
-                    ),
-                ],
-              ),
-            ],
-            const SectionHeader('Busy time'),
-            Text(
-              'Imported calendar time is kept free when planning.',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: 12),
-            SectionCard(
-              children: [
-                ListTile(
-                  leading: const Icon(Icons.upload_file),
-                  title: const Text('Import an .ics file'),
-                  trailing: const Icon(Icons.chevron_right),
-                  onTap: _busy ? null : () => _run(_import),
-                ),
-                for (final source in _sources.entries)
-                  ListTile(
-                    title: Text(_sourceName(source.key)),
-                    subtitle: Text('${source.value} busy periods'),
-                    trailing: IconButton(
-                      tooltip: 'Remove',
-                      icon: const Icon(Icons.delete_outline),
-                      onPressed: _busy
-                          ? null
-                          : () => _run(() async {
-                              await widget.services.db.deleteBusyBlocksBySource(
-                                source.key,
-                              );
-                              await _reload();
-                            }),
-                    ),
+                for (var i = 0; i < _dayKeys.length; i++)
+                  FilterChip(
+                    label: Text(_dayLabels[i]),
+                    selected: prefs.activeDays.contains(_dayKeys[i]),
+                    onSelected: (_) => _toggleDay(_dayKeys[i]),
                   ),
               ],
             ),
-          ],
-        ),
+          ),
+          _section('Timezone'),
+          ListTile(
+            leading: const Icon(Icons.public),
+            title: Text(prefs.timezone),
+            subtitle: timezoneWarning != null
+                ? Text(timezoneWarning,
+                    style: TextStyle(color: colorScheme.error))
+                : const Text('Captured from this device at setup.'),
+          ),
+          _section('Busy calendar imports (.ics)'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: OutlinedButton.icon(
+              onPressed: _importIcs,
+              icon: const Icon(Icons.file_upload),
+              label: const Text('Import .ics file'),
+            ),
+          ),
+          if (_busySources.isNotEmpty)
+            for (final source in _busySources.keys)
+              ListTile(
+                leading: const Icon(Icons.event_busy),
+                title: Text(source),
+                subtitle:
+                    Text('${_busySources[source]} busy block${_busySources[source] == 1 ? '' : 's'}'),
+                trailing: IconButton(
+                  tooltip: 'Remove',
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () => _deleteSource(source),
+                ),
+              ),
+          _section('Provider'),
+          ListTile(
+            leading: const Icon(Icons.tune),
+            title: const Text('LLM provider settings'),
+            subtitle: const Text(
+                'Free demo endpoint or your own key (BYOK). Keys live in '
+                'Keystore, never in SQLite.'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => openProviderSettings(context, widget.services),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _section(String title) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
+      child: Text(
+        title,
+        style: Theme.of(context)
+            .textTheme
+            .labelLarge
+            ?.copyWith(color: Theme.of(context).colorScheme.primary),
       ),
     );
   }

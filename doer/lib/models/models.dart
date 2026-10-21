@@ -63,6 +63,10 @@ class Task {
   final bool adjusted;
   final int skipCount;
   final String? deviceEventId;
+
+  /// The user moved this task's event in an external calendar app; the
+  /// imported schedule is fixed — never re-slotted by decompose/re-plan.
+  final bool userEdited;
   final String createdAt;
 
   Task({
@@ -79,6 +83,7 @@ class Task {
     this.adjusted = false,
     this.skipCount = 0,
     this.deviceEventId,
+    this.userEdited = false,
     required this.createdAt,
   });
 
@@ -97,6 +102,7 @@ class Task {
     int? skipCount,
     String? deviceEventId,
     String? createdAt,
+    bool? userEdited,
     bool clearSchedule = false,
     bool clearDeviceEventId = false,
     bool clearPinnedDeadline = false,
@@ -114,6 +120,7 @@ class Task {
     adjusted: adjusted ?? this.adjusted,
     skipCount: skipCount ?? this.skipCount,
     deviceEventId: clearDeviceEventId ? null : (deviceEventId ?? this.deviceEventId),
+    userEdited: userEdited ?? this.userEdited,
     createdAt: createdAt ?? this.createdAt,
   );
 
@@ -131,6 +138,7 @@ class Task {
     'adjusted': adjusted ? 1 : 0,
     'skip_count': skipCount,
     'device_event_id': deviceEventId,
+    'user_edited': userEdited ? 1 : 0,
     'created_at': createdAt,
   };
 
@@ -148,6 +156,7 @@ class Task {
     adjusted: (map['adjusted'] ?? 0) == 1,
     skipCount: map['skip_count'] ?? 0,
     deviceEventId: map['device_event_id'],
+    userEdited: (map['user_edited'] ?? 0) == 1,
     createdAt: map['created_at'],
   );
 }
@@ -155,12 +164,17 @@ class Task {
 class BusyBlock {
   final String id;
   final String source;
+
+  /// Event title from the device calendar; null for .ics-imported blocks
+  /// (the format carries no per-block title through this path).
+  final String? title;
   final DateTime start;
   final DateTime end;
 
   BusyBlock({
     required this.id,
     required this.source,
+    this.title,
     required this.start,
     required this.end,
   });
@@ -168,6 +182,7 @@ class BusyBlock {
   Map<String, dynamic> toMap() => {
     'id': id,
     'source': source,
+    'title': title,
     'start': start.toIso8601String(),
     'end': end.toIso8601String(),
   };
@@ -175,6 +190,7 @@ class BusyBlock {
   factory BusyBlock.fromMap(Map<String, dynamic> map) => BusyBlock(
     id: map['id'],
     source: map['source'],
+    title: map['title'],
     start: DateTime.parse(map['start']),
     end: DateTime.parse(map['end']),
   );
