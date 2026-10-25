@@ -9,10 +9,10 @@
     "run_worker_first": ["/api/*"]
   },
   "vars": {
-    "DEMO_MODEL": "qwen/qwen3.8-27b:free",
+    "DEMO_MODEL": "xingchen-agi/xing4.0-29b-a4b:free",
     "DEMO_UPSTREAM": "https://openrouter.ai/api/v1",
     "PIPEDREAM_ENVIRONMENT": "development",
-    "ALLOWED_ORIGINS": "http://localhost:8787"
+    "ALLOWED_ORIGINS": "*"
   },
   "ratelimits": [
     { "name": "DEMO_USER_LIMIT", "namespace_id": "1001", "simple": { "limit": 6, "period": 60 } },

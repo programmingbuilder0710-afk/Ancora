@@ -24,7 +24,7 @@ class ProviderConfigService {
   // install works out of the box against these; everything is editable in
   // Settings (the "demo endpoint" is just config the user can replace).
   static const defaultDemoBaseUrl = 'https://openrouter.ai/api/v1';
-  static const defaultDemoModel = 'qwen/qwen3.8-27b:free';
+  static const defaultDemoModel = 'xingchen-agi/xing4.0-29b-a4b:free';
   static const defaultDemoApiKey = '';
 
   /// Storage seam for tests: override read/write instead of the plugin.
