@@ -29,7 +29,7 @@ flowchart LR
 ### 1.1 Invariants
 
 1. **LLM does semantics only.** It decomposes goals into tasks and judges *which day* a task belongs on. It never computes times, durations-of-fit, feasibility, or interval math. `scheduled_start`/`scheduled_end` are slotter-owned.
-2. **Completion is monotonic.** A `completed` task is frozen forever; re-planning touches only unfinished work.
+2. **Completion is monotonic.** A `completed` task is frozen to the system — re-planning, skip, and reconcile never touch it — and reversible only by the explicit user action "un-complete" (`Orchestrator.uncompleteTask`), which re-slots it (keeping a user-pinned schedule).
 3. **SQLite is the source of truth.** The device calendar is a projection; every written event id (`device_event_id`) maps back to a task row.
 4. **The app writes exactly one calendar** — `"My Plan"` — and never reads beyond busy-block ingestion or writes anything outside it.
 5. **All provider output is schema-validated** with at most one automatic repair retry, then fail-fast.
@@ -430,5 +430,5 @@ Free-form multi-goal intake (no forced scaffolding): each goal is a short-term t
 - Built-in demo uses the Worker with the install UUID; OpenRouter secrets never reach the client.
 - Proxy limits: 200 KB input, 4,000 output tokens, 90 s timeout, 6/user and 20/IP requests/minute per location; provider dashboard caps spend.
 - BYOK stays direct; all placement remains deterministic on-device.
-- Done offers five seconds of Undo before monotonic completion; background/disposal flushes pending completions.
+- Done offers five seconds of Undo before monotonic completion; background/disposal flushes pending completions. After commitment, the completed check icon is a tap-to-undo that re-slots the task (user-pinned schedules are kept).
 - Goal planning returns to the earliest planned day; archived goals can be restored; web hashes preserve tabs.

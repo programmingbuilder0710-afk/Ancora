@@ -38,7 +38,7 @@ CalendarService.atomicRewrite() → device_calendar plugin
 
 Key invariants:
 - **LLM does semantics only** — never placement math
-- **Monotonic completion** — `status == completed` tasks are never re-edited
+- **Monotonic completion** — `status == completed` tasks are never re-edited by the system (re-plan/skip/reconcile); only the explicit `uncompleteTask` user action can flip them back to pending
 - **7-day horizon** — `Orchestrator.horizonDays = 7`; busy-block query `[today, today+7d)`
 - **No backend/proxy** — Flutter calls the LLM provider directly (OpenAI-compatible; demo key or BYOK)
 

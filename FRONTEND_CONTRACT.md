@@ -85,6 +85,7 @@ Future<List<PlacementResult>> decompose({
 Implementation details:
 - The model's `remaining_free_hours` field is misnamed: it is total placed-task hours, not busy-minus-placed free capacity; task intervals are not clipped per day.
 - LLM task IDs are advisory for decomposition; accepted tasks receive fresh UUIDs. Duplicate model IDs are not deduplicated. Malformed rows, unknown goal IDs, duration outside 5–480, unparsable/out-of-horizon dates, and unknown/self prerequisites are dropped; title-length/exact date spelling are not locally checked; cyclic tasks remain with all in-batch prerequisite edges cleared.
+- Rows whose title (trimmed, case-insensitive, whitespace-collapsed) equals an existing task title owned by a **different** goal are dropped as copies of `already_scheduled_tasks`; prerequisites pointing at them are discarded. If only copies come back, `decompose()` throws `Exception('LLM returned no valid tasks')`.
 - Accepted rows are committed before Slotter/calendar work. Repeated decomposition creates more tasks; this method is not idempotent. A later exception can leave partial SQLite state.
 - Only non-null placements are persisted. If an existing scheduled pending task becomes unscheduled, its old SQLite schedule is not cleared. Calendar rewrite can leave stale device IDs after swallowed failures, and returned result tasks do not receive successfully stored device IDs.
 
@@ -125,13 +126,12 @@ Future<void> completeTask(String taskId)```
 
 **Throws:** `Exception('Task not found: $taskId')` plus DB errors.
 
-#### `moveTask`
+#### `uncompleteTask`
 ```dart
-Future<Task> moveTask(String taskId,
-    {required DateTime start, required DateTime end})```
-**Manual time change, local, no LLM.** Writes the user-chosen `start`–`end` (local datetimes from the agenda's date+time pickers) to SQLite, sets the `user_edited` pin so `decompose`/`replan` never re-slot it and `Slotter` treats it as fixed occupancy, then best-effort deletes the old device event and writes a new one (failures swallowed; a stale `device_event_id` is reconciled on the next busy sync). Accepts pending/skipped and unscheduled (needs-attention) tasks; the agenda exposes it via the tile's calendar-edit icon, with the date picker constrained to `[today, today+6]`.
+Future<PlacementResult> uncompleteTask(String taskId)```
+**Explicit user undo — the one exception to monotonic completion.** A non-completed ID is a silent no-op returning the task unchanged. A user-pinned (`userEdited`) scheduled task keeps its slot; only the status flips to pending. Any other completed task is re-slotted like `skipTask` — schedule and device ID cleared, occupancy from busy blocks and other scheduled tasks, search from `max(recommended day, today)` — but `skipCount` is **not** bumped. SQLite is written first; the old device event is deleted and a new one written at the new placement, both best-effort (swallowed failures).
 
-**Throws:** `Exception('Task not found: $taskId')`, `Exception('Cannot move a completed task')`, `Exception('End must be after start')`, plus DB errors. Never calls `providerFactory`.
+**Throws:** `Exception('Task not found: $taskId')` plus DB errors.
 
 #### `importIcsFile`
 ```dart
@@ -446,7 +446,7 @@ class Task {
 }
 ```
 
-**Monotonic completion contract:** `status == completed` ⇒ completed tasks are never edited by `replan()`, `skipTask()`, or `completeTask()` again. `Slotter` freezes a non-pending task only when that task is included in its `tasks` argument and already has a schedule; `Orchestrator.decompose()`/`replan()` currently pass only pending tasks, so completed tasks inform LLM summaries but are not hard occupancy inputs to Slotter.
+**Monotonic completion contract:** `status == completed` ⇒ completed tasks are never edited by `replan()`, `skipTask()`, or `completeTask()` again. The single sanctioned transition out of `completed` is the explicit user action `uncompleteTask()`. `Slotter` freezes a non-pending task only when that task is included in its `tasks` argument and already has a schedule; `Orchestrator.decompose()`/`replan()` currently pass only pending tasks, so completed tasks inform LLM summaries but are not hard occupancy inputs to Slotter.
 
 ### BusyBlock
 ```dart
@@ -771,7 +771,7 @@ Future<List<PlacementResult>> scheduleGoals(
 Implementation details:
 - Empty `goals` returns `[]` before calling `providerFactory`. Supplied goals are context only; the method does not insert them.
 - The busy-block query range is `[local midnight today, today+7d)`. Slotter searches seven dates ending today+6.
-- Documents are included for `decompose()` only. Existing pending scheduled tasks are sent as a digest; `remaining_free_hours` is actually placed-task hours and does not subtract busy time.
+- Documents are included for `decompose()` only. Existing pending scheduled tasks are sent as `already_scheduled_tasks` (load context only; the prompt forbids copying them); `remaining_free_hours` is actually placed-task hours and does not subtract busy time.
 - Accepted rows are committed before Slotter/calendar work. Repeated calls create duplicates. Only non-null placements are persisted. An existing pending task that becomes unscheduled can therefore leave SQLite/calendar divergence: its result is null-scheduled, its old SQLite schedule stays, `atomicRewrite` may delete its old event, and the row retains a stale `deviceEventId`.
 
 #### `Orchestrator.replan`: explicit user action with completed freeze
