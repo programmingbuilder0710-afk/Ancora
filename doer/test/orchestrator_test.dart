@@ -509,6 +509,114 @@ void main() {
 
     await helper.close();
   });
+
+  test('moveTask: manual move pins the slot and survives replan', () async {
+  final helper = DatabaseHelper.forTest();
+  final today = DateTime.now();
+  String dayKey(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+  final day1 = dayKey(today.add(const Duration(days: 1)));
+  final day3 = today.add(const Duration(days: 3));
+
+  final g = Goal(
+    id: 'g-move',
+    title: 'Learn Rust',
+    description: '',
+    priority: GoalPriority.P1,
+    targetDate: dayKey(today.add(const Duration(days: 6))),
+    createdAt: today.toIso8601String(),
+  );
+  await helper.insertGoal(g);
+  await helper.insertTask(Task(
+    id: 't-move',
+    goalId: 'g-move',
+    title: 'Read chapter 1',
+    durationMinutes: 60,
+    recommendedDay: day1,
+    scheduledStart: '${day1}T09:00:00.000',
+    scheduledEnd: '${day1}T10:00:00.000',
+    createdAt: today.toIso8601String(),
+  ));
+
+  final moved = await Orchestrator(
+    db: helper,
+    providerFactory: () => throw StateError('unreachable'),
+    slotter: Slotter(await _prefsOrDefault(helper))
+      ..allGoals = {'g-move': g},
+  ).moveTask('t-move',
+      start: DateTime(day3.year, day3.month, day3.day, 14, 30),
+      end: DateTime(day3.year, day3.month, day3.day, 15, 30));
+
+  expect(moved.userEdited, isTrue);
+  expect(moved.scheduledStart,
+      DateTime(day3.year, day3.month, day3.day, 14, 30).toIso8601String());
+
+  final persisted = await helper.getTask('t-move');
+  expect(persisted!.userEdited, isTrue);
+  expect(persisted.scheduledEnd,
+      DateTime(day3.year, day3.month, day3.day, 15, 30).toIso8601String());
+
+  // Guards: completed tasks are frozen; end must follow start.
+  await helper.insertTask(Task(
+    id: 't-done',
+    goalId: 'g-move',
+    title: 'Done task',
+    durationMinutes: 30,
+    recommendedDay: day1,
+    scheduledStart: '${day1}T11:00:00.000',
+    scheduledEnd: '${day1}T11:30:00.000',
+    status: TaskStatus.completed,
+    createdAt: today.toIso8601String(),
+  ));
+  final localOrchestrator = Orchestrator(
+    db: helper,
+    providerFactory: () => throw StateError('unreachable'),
+    slotter: Slotter(await _prefsOrDefault(helper))
+      ..allGoals = {'g-move': g},
+  );
+  await expectLater(
+    localOrchestrator.moveTask('t-done',
+        start: day3, end: day3.add(const Duration(hours: 1))),
+    throwsException,
+  );
+  await expectLater(
+    localOrchestrator.moveTask('t-move',
+        start: day3.add(const Duration(hours: 2)),
+        end: day3.add(const Duration(hours: 1))),
+    throwsException,
+    reason: 'end must be after start',
+  );
+
+  // Replan (LLM suggests re-dating the task) must keep the pinned slot.
+  final reprovider = FakeProvider({
+    'tasks': [
+      {
+        'task_id': 't-move',
+        'goal_id': 'g-move',
+        'title': 'Read chapter 1',
+        'duration_minutes': 60,
+        'recommended_day': day1,
+        'prerequisite_ids': [],
+      },
+    ],
+  });
+  await Orchestrator(
+    db: helper,
+    providerFactory: () => reprovider,
+    slotter: Slotter(await _prefsOrDefault(helper))
+      ..allGoals = {'g-move': g},
+  ).replan();
+
+  final afterReplan = await helper.getTask('t-move');
+  expect(afterReplan!.userEdited, isTrue);
+  expect(
+    afterReplan.scheduledStart,
+    moved.scheduledStart,
+    reason: 'replan never re-slots a manually moved task',
+  );
+
+  await helper.close();
+  });
 }
 
 class _RetryThenFailProvider implements LlmProvider {

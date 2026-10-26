@@ -128,6 +128,52 @@ class _AgendaScreenState extends State<AgendaScreen> {
     DataReload.bump();
   }
 
+  /// Manual time change: date + time pickers, then a local moveTask (no
+  /// LLM — the user picks the slot). Sets the user_edited pin so
+  /// decompose/re-plan keep the chosen time fixed. Callable for any
+  /// non-completed task, including needs-attention (unscheduled) ones.
+  Future<void> _moveTask(Task task) async {
+    if (task.status == TaskStatus.completed) return;
+    final today = _today;
+    final initialDay = task.scheduledStart != null
+        ? DateTime.parse(task.scheduledStart!)
+        : today;
+    final date = await showDatePicker(
+      context: context,
+      initialDate: initialDay.isBefore(today) ? today : initialDay,
+      firstDate: today,
+      // The plan horizon is 7 rolling days; a manual move may not exceed
+      // it (the slotter never places beyond it either).
+      lastDate: today.add(const Duration(days: horizonDays - 1)),
+    );
+    if (date == null || !mounted) return;
+    final initialTime = task.scheduledStart != null
+        ? TimeOfDay.fromDateTime(DateTime.parse(task.scheduledStart!))
+        : const TimeOfDay(hour: 9, minute: 0);
+    final time = await showTimePicker(
+      context: context,
+      initialTime: initialTime,
+    );
+    if (time == null) return;
+    final start =
+        DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    final end = start.add(Duration(minutes: task.durationMinutes));
+    try {
+      final orchestrator = await widget.services.buildLocalOrchestrator();
+      await orchestrator.moveTask(task.id, start: start, end: end);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              'Moved to ${DateFormat('EEE, MMM d · HH:mm').format(start)}'),
+        ));
+      }
+    } on Exception catch (e) {
+      _showError('Could not move: $e');
+      return;
+    }
+    DataReload.bump();
+  }
+
   /// Re-plan: LLM pass over all unfinished tasks. Non-blocking UX — a thin
   /// progress bar shows while the call runs; the shell stays usable.
   Future<void> _replan() async {
@@ -257,6 +303,7 @@ class _AgendaScreenState extends State<AgendaScreen> {
                   onComplete: _completeTask,
                   onUncomplete: _uncompleteTask,
                   onSkip: _skipTask,
+                  onMove: _moveTask,
                 );
               },
             ),
@@ -317,6 +364,7 @@ class _DayPage extends StatelessWidget {
     required this.onComplete,
     required this.onUncomplete,
     required this.onSkip,
+    required this.onMove,
   });
 
   final DateTime day;
@@ -328,6 +376,7 @@ class _DayPage extends StatelessWidget {
   final Future<void> Function(Task) onComplete;
   final Future<void> Function(Task) onUncomplete;
   final Future<void> Function(Task) onSkip;
+  final Future<void> Function(Task) onMove;
 
   @override
   Widget build(BuildContext context) {
@@ -384,6 +433,7 @@ class _DayPage extends StatelessWidget {
             onComplete: onComplete,
             onUncomplete: onUncomplete,
             onSkip: onSkip,
+            onMove: onMove,
           ),
         if (unscheduledTasks.isNotEmpty) ...[
           Padding(
@@ -402,6 +452,7 @@ class _DayPage extends StatelessWidget {
               onComplete: () => onComplete(task),
               onUncomplete: () => onUncomplete(task),
               onSkip: () => onSkip(task),
+              onMove: () => onMove(task),
             ),
         ],
       ],
@@ -462,6 +513,7 @@ class _GoalGroup extends StatelessWidget {
     required this.onComplete,
     required this.onSkip,
     required this.onUncomplete,
+    required this.onMove,
   });
 
   final Goal? goal;
@@ -469,6 +521,8 @@ class _GoalGroup extends StatelessWidget {
   final Future<void> Function(Task) onComplete;
   final Future<void> Function(Task) onUncomplete;
   final Future<void> Function(Task) onSkip;
+  final Future<void> Function(Task) onMove;
+
 
   @override
   Widget build(BuildContext context) {
@@ -500,6 +554,7 @@ class _GoalGroup extends StatelessWidget {
             onComplete: () => onComplete(task),
             onUncomplete: () => onUncomplete(task),
             onSkip: () => onSkip(task),
+            onMove: () => onMove(task),
           ),
       ],
     );
@@ -512,12 +567,15 @@ class _TaskTile extends StatelessWidget {
     required this.onComplete,
     required this.onUncomplete,
     required this.onSkip,
+    required this.onMove,
   });
 
   final Task task;
   final VoidCallback onComplete;
   final VoidCallback onUncomplete;
   final VoidCallback onSkip;
+  final VoidCallback onMove;
+
 
   @override
   Widget build(BuildContext context) {
@@ -541,6 +599,7 @@ class _TaskTile extends StatelessWidget {
                 children: [
                   Text(
                     start,
+                    maxLines: 1,
                     style: Theme.of(context).textTheme.titleSmall?.copyWith(
                           color: done || skipped
                               ? colorScheme.outline
@@ -553,6 +612,7 @@ class _TaskTile extends StatelessWidget {
                   if (end != null && end != start)
                     Text(
                       end,
+                      maxLines: 1,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
                             color: colorScheme.outline,
                           ),
@@ -603,6 +663,11 @@ class _TaskTile extends StatelessWidget {
                   tooltip: "Didn't Start",
                   icon: const Icon(Icons.skip_next),
                   onPressed: onSkip,
+                ),
+                IconButton(
+                  tooltip: 'Change time',
+                  icon: const Icon(Icons.edit_calendar),
+                  onPressed: onMove,
                 ),
               ],
             ),

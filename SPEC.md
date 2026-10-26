@@ -249,6 +249,9 @@ For each active day in the rolling horizon `[today, today+7)`:
 ### 5.4 Skip re-slot ("Didn't Start" tap) — local, no LLM
 Mark task `skipped`, `skip_count++`; re-place with earliest allowed day = `max(today, original day)`; compress per §5.3 if needed; shift dependent unfinished tasks whose day constraints break; delete + rewrite affected device events only. Runs in milliseconds, offline.
 
+### 5.4a Manual move ("Change time" tap) — local, no LLM
+The user is the placement authority: agenda date+time pickers choose a slot inside `[today, today+6]`; duration stays `duration_minutes`. The slot is written to SQLite, `user_edited` is set (same pin as external calendar moves — §5.3 occupancy keeps it fixed; decompose/re-plan never re-slot it), and the device event is deleted+rewritten best-effort. Needs-attention (unscheduled) tasks can be placed this way. Completed tasks are frozen and cannot move.
+
 ### 5.5 Full re-plan — LLM pass + atomic rewrite
 1. Send re-plan request (§4.3).
 2. Slotter places the returned unfinished set (same guards; completed tasks frozen and untouched).

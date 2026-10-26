@@ -125,6 +125,14 @@ Future<void> completeTask(String taskId)```
 
 **Throws:** `Exception('Task not found: $taskId')` plus DB errors.
 
+#### `moveTask`
+```dart
+Future<Task> moveTask(String taskId,
+    {required DateTime start, required DateTime end})```
+**Manual time change, local, no LLM.** Writes the user-chosen `start`–`end` (local datetimes from the agenda's date+time pickers) to SQLite, sets the `user_edited` pin so `decompose`/`replan` never re-slot it and `Slotter` treats it as fixed occupancy, then best-effort deletes the old device event and writes a new one (failures swallowed; a stale `device_event_id` is reconciled on the next busy sync). Accepts pending/skipped and unscheduled (needs-attention) tasks; the agenda exposes it via the tile's calendar-edit icon, with the date picker constrained to `[today, today+6]`.
+
+**Throws:** `Exception('Task not found: $taskId')`, `Exception('Cannot move a completed task')`, `Exception('End must be after start')`, plus DB errors. Never calls `providerFactory`.
+
 #### `importIcsFile`
 ```dart
 Future<int> importIcsFile(String filePath, String sourceName)```

@@ -589,6 +589,44 @@ Return only JSON matching the required schema.
     await db.updateTask(task.copyWith(status: TaskStatus.completed));
   }
 
+  /// Manually move a task to [start]–[end] (local datetimes chosen by the
+  /// user in the agenda). Local, instant, no LLM: the user — not the
+  /// slotter — is the placement authority. Sets the user_edited pin so
+  /// decompose/re-plan never re-slot it and the slotter keeps the time
+  /// fixed (same semantics as moving the event in an external calendar
+  /// app). SQLite is committed first; device-calendar delete+rewrite is
+  /// best-effort (failures swallowed, id kept stale — reconciled later).
+  Future<Task> moveTask(String taskId,
+      {required DateTime start, required DateTime end}) async {
+    final task = await db.getTask(taskId);
+    if (task == null) throw Exception('Task not found: $taskId');
+    if (task.status == TaskStatus.completed) {
+      throw Exception('Cannot move a completed task');
+    }
+    if (!end.isAfter(start)) throw Exception('End must be after start');
+
+    final moved = task.copyWith(
+      scheduledStart: start.toIso8601String(),
+      scheduledEnd: end.toIso8601String(),
+      userEdited: true,
+    );
+    await db.updateTask(moved);
+
+    if (calendar != null) {
+      if (task.deviceEventId != null) {
+        try {
+          await calendar!.deleteEvent(task.deviceEventId!);
+        } catch (_) {}
+      }
+      try {
+        final newId = await calendar!.writeTaskEvent(moved);
+        await db.updateTask(moved.copyWith(deviceEventId: newId));
+      } catch (_) {}
+    }
+
+    return moved;
+  }
+
   /// Un-complete a task: set pending again. Explicit user undo is the one
   /// exception to monotonic completion — re-plan/skip still never touch a
   /// completed task. Re-slots into free time like skipTask, without the
