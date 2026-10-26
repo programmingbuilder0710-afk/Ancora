@@ -295,7 +295,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
           _section('Provider'),
           ListTile(
-            leading: const Icon(Icons.tune),
+            leading: const Icon(Icons.settings),
             title: const Text('LLM provider settings'),
             subtitle: const Text(
                 'Free demo endpoint or your own key (BYOK). Keys live in '

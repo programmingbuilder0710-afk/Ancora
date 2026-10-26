@@ -254,7 +254,7 @@ class ConnectedCalendars {
     List<Task> creates,
   ) async {
     final response = await _request(
-      'events',
+      'plan-writes',
       method: 'POST',
       body: {
         'account_id': account,

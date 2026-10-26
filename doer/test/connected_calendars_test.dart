@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:doer/app_services.dart';
 import 'package:doer/calendar/connected_calendars.dart';
 import 'package:doer/data/database_helper.dart';
 import 'package:doer/extraction/extraction.dart';
@@ -152,7 +153,7 @@ void main() {
     final requests = <Map<String, dynamic>>[];
     final connected = FakeConnected(
       MockClient((request) async {
-        expect(request.url.path, '/api/events');
+        expect(request.url.path, '/api/plan-writes');
         final body = jsonDecode(request.body) as Map<String, dynamic>;
         requests.add(body);
         return http.Response(
@@ -206,6 +207,130 @@ void main() {
     await calendar.deleteEvent('pd:old:old-one');
     expect(requests.last['account_id'], 'old');
   });
+
+  test(
+    'changing the plan target moves pending events and clearing removes them',
+    () async {
+      final requests = <Map<String, dynamic>>[];
+      final connected = FakeConnected(
+        MockClient((request) async {
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          requests.add(body);
+          return http.Response(
+            jsonEncode({
+              'created': {
+                for (final t in body['create']) t['key']: 'event-${t['key']}',
+              },
+              'errors': [],
+            }),
+            200,
+          );
+        }),
+        db,
+      );
+      final services = await AppServices.load(db: db, initCalendar: false)
+        ..connected = connected;
+      await db.insertGoal(
+        Goal(
+          id: 'goal',
+          title: 'Goal',
+          description: '',
+          priority: GoalPriority.P1,
+          targetDate: '2026-12-31',
+          createdAt: now.toIso8601String(),
+        ),
+      );
+      Task task(String id, {String? event, bool done = false}) => Task(
+        id: id,
+        goalId: 'goal',
+        title: id,
+        durationMinutes: 60,
+        createdAt: now.toIso8601String(),
+        scheduledStart: start.toIso8601String(),
+        scheduledEnd: end.toIso8601String(),
+        status: done ? TaskStatus.completed : TaskStatus.pending,
+        deviceEventId: event,
+      );
+      await db.insertTasks([
+        task('fresh'),
+        task('moved', event: 'pd:old:e1'),
+        task('done', event: 'pd:old:kept', done: true),
+      ]);
+
+      await connected.setPlanAccountId('new');
+      await services.projectPlan();
+      final old = requests.singleWhere((r) => r['account_id'] == 'old');
+      final target = requests.singleWhere((r) => r['account_id'] == 'new');
+      expect(old['delete'], ['e1']);
+      expect(target['delete'], isEmpty);
+      expect(
+        (target['create'] as List).map((t) => t['key']).toSet(),
+        {'fresh', 'moved'},
+      );
+      expect((await db.getTask('fresh'))!.deviceEventId, 'pd:new:event-fresh');
+      expect((await db.getTask('moved'))!.deviceEventId, 'pd:new:event-moved');
+      expect((await db.getTask('done'))!.deviceEventId, 'pd:old:kept');
+
+      requests.clear();
+      await connected.setPlanAccountId(null);
+      await services.projectPlan();
+      expect(requests, hasLength(1));
+      expect(requests.single['account_id'], 'new');
+      expect(
+        (requests.single['delete'] as List).toSet(),
+        {'event-fresh', 'event-moved'},
+      );
+      expect(requests.single['create'], isEmpty);
+    },
+  );
+
+  test(
+    'deleting a pending task removes its event from the plan target',
+    () async {
+      final requests = <Map<String, dynamic>>[];
+      final connected = FakeConnected(
+        MockClient((request) async {
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          requests.add(body);
+          return http.Response(
+            jsonEncode({'created': {}, 'errors': []}),
+            200,
+          );
+        }),
+        db,
+      );
+      final services = await AppServices.load(db: db, initCalendar: false)
+        ..connected = connected;
+      await db.insertGoal(
+        Goal(
+          id: 'goal',
+          title: 'Goal',
+          description: '',
+          priority: GoalPriority.P1,
+          targetDate: '2026-12-31',
+          createdAt: now.toIso8601String(),
+        ),
+      );
+      final task = Task(
+        id: 'doomed',
+        goalId: 'goal',
+        title: 'Doomed',
+        durationMinutes: 60,
+        createdAt: now.toIso8601String(),
+        scheduledStart: start.toIso8601String(),
+        scheduledEnd: end.toIso8601String(),
+        deviceEventId: 'pd:acct:event-1',
+      );
+      await db.insertTask(task);
+
+      await services.deleteTask(task);
+      expect(await db.getTask('doomed'), isNull);
+      expect(requests, hasLength(1));
+      expect(requests.single['account_id'], 'acct');
+      expect(requests.single['delete'], ['event-1']);
+      expect(requests.single['create'], isEmpty);
+    },
+  );
 
   test(
     'calendar writes throw individually and rewrite tolerates account failures',

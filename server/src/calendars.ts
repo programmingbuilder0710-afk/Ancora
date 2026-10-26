@@ -63,11 +63,27 @@ export async function readBusy(proxy: Proxy, account: Account, start: string, en
   }
   return blocks;
 }
+// Pipedream's managed Google OAuth client grants calendar.events and calendar.readonly,
+// not calendar creation, so inserting "My Plan" is denied (403). Google plans then go to
+// the primary calendar as "free" time, which keeps them out of freeBusy and therefore
+// out of Doer's own busy sync.
+async function planCalendar(proxy: Proxy, isGoogle: boolean): Promise<{ id: string; primary: boolean }> {
+  const plan = (await calendars(proxy, isGoogle ? apps[0] : apps[1])).find(c => isGoogle
+    ? c.summary === 'My Plan' && ['owner', 'writer'].includes(c.accessRole) : c.name === 'My Plan');
+  if (plan?.id) return { id: plan.id, primary: false };
+  let created: Json;
+  try {
+    created = await proxy(isGoogle ? `${google}/calendars` : `${outlook}/me/calendars`, 'POST', isGoogle ? { summary: 'My Plan' } : { name: 'My Plan' });
+  } catch (e) {
+    if (isGoogle && typeof e === 'object' && e !== null && 'status' in e && e.status === 403) return { id: 'primary', primary: true };
+    throw e;
+  }
+  if (!created.id) throw new Error('Could not create My Plan');
+  return { id: created.id, primary: false };
+}
 export async function writeEvents(proxy: Proxy, account: Account, deletes: string[], creates: Json[]) {
   const isGoogle = account.app === apps[0];
-  let plan = (await calendars(proxy, account.app)).find(c => (isGoogle ? c.summary : c.name) === 'My Plan');
-  if (!plan) plan = await proxy(isGoogle ? `${google}/calendars` : `${outlook}/me/calendars`, 'POST', isGoogle ? { summary: 'My Plan' } : { name: 'My Plan' });
-  if (!plan.id) throw new Error('Could not create My Plan');
+  const plan = await planCalendar(proxy, isGoogle);
   const base = isGoogle ? `${google}/calendars/${encodeURIComponent(plan.id)}/events` : `${outlook}/me/calendars/${encodeURIComponent(plan.id)}/events`;
   const created: Record<string, string> = {}, errors: Json[] = [];
   for (const id of deletes) {
@@ -78,6 +94,7 @@ export async function writeEvents(proxy: Proxy, account: Account, deletes: strin
     try {
       const data = await proxy(base, 'POST', isGoogle ? {
         summary: event.title, description: 'Planned by Doer', start: { dateTime: event.start }, end: { dateTime: event.end },
+        ...(plan.primary ? { transparency: 'transparent' } : {}),
       } : {
         subject: event.title, body: { contentType: 'text', content: 'Planned by Doer' },
         start: { dateTime: event.start.replace(/Z$/, ''), timeZone: 'UTC' }, end: { dateTime: event.end.replace(/Z$/, ''), timeZone: 'UTC' },

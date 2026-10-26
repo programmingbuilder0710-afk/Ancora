@@ -126,12 +126,40 @@ class AppServices {
   }
 
   Future<PlanCalendar?> _planCalendar() async {
+    // Web plan target wins; otherwise Android uses the device calendar
+    // (server/README: plan writes on Android stay local to the device).
     if (kIsWeb &&
         connected != null &&
         await connected!.planAccountId() != null) {
       return PipedreamPlanCalendar(connected!);
     }
     return calendar;
+  }
+
+  /// Re-projects pending scheduled tasks after the web plan target changes:
+  /// removes their events from the previous account and writes them to the
+  /// new one (or nowhere, if the target was cleared). Best effort, like
+  /// Orchestrator placement writes; completed tasks keep their events.
+  Future<void> projectPlan() async {
+    if (connected == null) return;
+    final tasks = [
+      for (final t in await db.getTasksByStatus(TaskStatus.pending))
+        if (t.scheduledStart != null && t.scheduledEnd != null) t,
+    ];
+    final ids = await PipedreamPlanCalendar(connected!).atomicRewrite(
+      [for (final t in tasks) PlacementResult(t)],
+      {
+        for (final t in tasks)
+          if (t.deviceEventId != null) t.id: t.deviceEventId!,
+      },
+    );
+    for (final MapEntry(key: id, value: eventId) in ids.entries) {
+      // Keep any completion that happened while the calendar was responding.
+      final latest = await db.getTask(id);
+      if (latest != null) {
+        await db.updateTask(latest.copyWith(deviceEventId: eventId));
+      }
+    }
   }
 
   Future<void> renameTask(Task task, String title) async {
@@ -168,7 +196,16 @@ class AppServices {
     if (current == null || current.status != TaskStatus.pending) return;
     if (current.deviceEventId != null) {
       try {
-        await (await _planCalendar())?.deleteEvent(current.deviceEventId!);
+        // A web event knows its own account (pd:<account>:<id>); delete there
+        // even when no plan target is currently selected, so clearing the
+        // target never silently strands the event. Native ids fall through
+        // to the device calendar.
+        if (current.deviceEventId!.startsWith('pd:') && connected != null) {
+          await PipedreamPlanCalendar(connected!)
+              .deleteEvent(current.deviceEventId!);
+        } else {
+          await (await _planCalendar())?.deleteEvent(current.deviceEventId!);
+        }
       } catch (_) {
         // Calendar cleanup must not block local deletion.
       }

@@ -31,6 +31,7 @@ class AgendaScreen extends StatefulWidget {
 class _AgendaScreenState extends State<AgendaScreen> {
   List<Goal> _goals = [];
   List<Task> _tasks = [];
+  List<BusyBlock> _busyBlocks = [];
   DateTime _day = DateUtils.dateOnly(DateTime.now());
   bool _loading = true;
   bool _busy = false;
@@ -101,22 +102,45 @@ class _AgendaScreenState extends State<AgendaScreen> {
     _lifecycle = AppLifecycleListener(
       onHide: _onBackground,
       onPause: _onBackground,
+      onResume: _syncCalendars,
     );
     _clockTimer = Timer.periodic(
       const Duration(minutes: 1),
       (_) => setState(() {}),
     );
-    _reload();
+    _reload().then((_) => _syncCalendars());
+  }
+
+  /// Pulls connected-calendar and subscription busy time, so edits made in
+  /// Google/Outlook show up without visiting Settings.
+  Future<void> _syncCalendars() async {
+    final connected = widget.services.connected;
+    if (connected == null) return;
+    try {
+      widget.services.lastSyncWarning = await connected.syncBusy(
+        widget.services.db,
+      );
+    } catch (_) {
+      widget.services.lastSyncWarning =
+          'Calendars could not sync. Planning uses saved busy times.';
+    }
+    if (mounted) await _reload();
   }
 
   Future<void> _reload() async {
     try {
       final goals = await widget.services.db.getAllGoals(activeOnly: false);
       final tasks = await widget.services.db.getAllTasks();
+      final today = DateUtils.dateOnly(DateTime.now());
+      final busy = await widget.services.db.getBusyBlocksInRange(
+        today,
+        today.add(const Duration(days: Orchestrator.horizonDays)),
+      );
       if (mounted) {
         setState(() {
           _goals = goals;
           _tasks = tasks;
+          _busyBlocks = busy;
           _error = null;
         });
       }
@@ -151,6 +175,43 @@ class _AgendaScreenState extends State<AgendaScreen> {
             ),
           );
         }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(providerErrorMessage(e, demoMode: false))),
+        );
+      }
+    } finally {
+      await _reload();
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _uncompleteTask(Task task) async {
+    if (!await confirmAction(
+          context,
+          'Un-complete "${task.title}"? It becomes pending and is re-slotted '
+          'into free time.',
+        ) ||
+        !mounted) {
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final orchestrator = await widget.services.orchestrator();
+      final result = await orchestrator.uncompleteTask(task.id);
+      final start = result.task.scheduledStart;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              start == null
+                  ? "Un-completed — couldn't fit, needs attention"
+                  : 'Un-completed — moved to ${dayClock(context, DateTime.parse(start).toLocal())}',
+            ),
+          ),
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -367,10 +428,16 @@ class _AgendaScreenState extends State<AgendaScreen> {
                           width: 48,
                           height: 48,
                           child: completed
-                              ? Icon(
-                                  Icons.check_circle,
-                                  color: theme.colorScheme.primary,
-                                  semanticLabel: 'Completed',
+                              ? IconButton(
+                                  tooltip: 'Completed — tap to undo',
+                                  onPressed: _busy
+                                      ? null
+                                      : () => _uncompleteTask(task),
+                                  icon: Icon(
+                                    Icons.check_circle,
+                                    color: theme.colorScheme.primary,
+                                    semanticLabel: 'Completed',
+                                  ),
                                 )
                               : pending
                               ? IconButton.filledTonal(
@@ -505,6 +572,12 @@ class _AgendaScreenState extends State<AgendaScreen> {
           ..sort();
     final next = later.firstOrNull;
     final minutes = dayTasks.fold(0, (n, t) => n + t.durationMinutes);
+    final dayEnd = DateTime(_day.year, _day.month, _day.day + 1);
+    final dayBusy =
+        _busyBlocks
+            .where((b) => b.start.isBefore(dayEnd) && b.end.isAfter(_day))
+            .toList()
+          ..sort((a, b) => a.start.compareTo(b.start));
     return Scaffold(
       body: _loading
           ? const Center(child: CircularProgressIndicator())
@@ -530,7 +603,7 @@ class _AgendaScreenState extends State<AgendaScreen> {
                         if (_goals.isNotEmpty)
                           FilledButton.tonalIcon(
                             onPressed: _busy ? null : _replan,
-                            icon: const Icon(Icons.auto_awesome, size: 18),
+                            icon: const Icon(Icons.autorenew, size: 18),
                             label: const Text('Re-plan'),
                           ),
                       ],
@@ -626,6 +699,14 @@ class _AgendaScreenState extends State<AgendaScreen> {
                           ),
                         ),
                       ],
+                      if (dayBusy.isNotEmpty) ...[
+                        Padding(
+                          padding: const EdgeInsets.only(top: 24, bottom: 4),
+                          child: Text('Busy', style: theme.textTheme.titleSmall),
+                        ),
+                        for (final block in dayBusy)
+                          _BusyTile(block: block, day: _day),
+                      ],
                       if (dayTasks.isEmpty)
                         const EmptyState(
                           Icons.wb_sunny_outlined,
@@ -673,6 +754,48 @@ class _AgendaScreenState extends State<AgendaScreen> {
                 ),
               ),
             ),
+    );
+  }
+}
+
+/// Read-only busy time from a connected calendar, subscription, or .ics
+/// import, clipped to the selected day. Web free/busy data carries no
+/// event titles, so untitled blocks show their source instead.
+class _BusyTile extends StatelessWidget {
+  const _BusyTile({required this.block, required this.day});
+
+  final BusyBlock block;
+  final DateTime day;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final dayEnd = DateTime(day.year, day.month, day.day + 1);
+    final start = block.start.isBefore(day) ? day : block.start;
+    final end = block.end.isAfter(dayEnd) ? dayEnd : block.end;
+    final time = start == day && end == dayEnd
+        ? 'All day'
+        : '${DateFormat.jm().format(start)} – ${DateFormat.jm().format(end)}';
+    final title = block.title?.isNotEmpty == true ? block.title! : 'Busy';
+    return Opacity(
+      opacity: 0.75,
+      child: ListTile(
+        dense: true,
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(Icons.event_busy, color: theme.colorScheme.outline),
+        title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        subtitle: Text(
+          busySourceName(block.source),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: Text(
+          time,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.outline,
+          ),
+        ),
+      ),
     );
   }
 }

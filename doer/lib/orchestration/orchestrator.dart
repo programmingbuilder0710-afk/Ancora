@@ -204,7 +204,7 @@ class Orchestrator {
       }
     }
 
-    final pendingDigest = allTasks
+    final alreadyScheduled = allTasks
         .where(
           (t) => t.status == TaskStatus.pending && t.scheduledStart != null,
         )
@@ -224,14 +224,18 @@ class Orchestrator {
       'per_day_summary': perDaySummary,
       'goals': goalsContext,
       'documents': docsContext,
-      'pending_tasks_digest': pendingDigest,
+      'already_scheduled_tasks': alreadyScheduled,
     };
 
     final system = '''
 You are a scheduling assistant. Given a user's goals, documents, and per-day free time summaries,
-decompose each goal into concrete, duration-bounded atomic tasks. Assign each task a
-"recommended_day" (ISO YYYY-MM-DD) within the given horizon. Spread sessions instead of cramming.
-Respect goal target dates and balance load across goals by priority (P1 > P2 > P3).
+decompose each goal in "goals" into concrete, duration-bounded atomic tasks. Every task must be a
+step toward its own goal's title and description; base tasks on that goal alone. Return at least
+one task for every goal.
+Assign each task a "recommended_day" (ISO YYYY-MM-DD) within the given horizon. Spread sessions
+instead of cramming. Respect goal target dates and balance load across goals by priority (P1 > P2 > P3).
+"already_scheduled_tasks" is work already on the calendar, often for other goals. Use it only to see
+how loaded each day is. Never copy, repeat, or reword those tasks.
 Each task must have task_id, goal_id, title, duration_minutes, recommended_day, prerequisite_ids.
 prerequisite_ids must reference other task_ids in this same response (empty list if none).
 Return only JSON matching the required schema.
@@ -256,8 +260,18 @@ Return only JSON matching the required schema.
       );
     }
 
-    // Validate semantics
-    final tasks = _validateAndConvertTasks(response['tasks'] as List, goals);
+    // Validate semantics. Weak models echo already_scheduled_tasks back under
+    // the new goal's id; a verbatim title owned by another goal is a copy.
+    final titleOwners = <String, Set<String>>{};
+    for (final t in allTasks) {
+      titleOwners.putIfAbsent(_titleKey(t.title), () => {}).add(t.goalId);
+    }
+    final tasks = _validateAndConvertTasks(
+      response['tasks'] as List,
+      goals,
+      isCopy: (goalId, title) =>
+          titleOwners[_titleKey(title)]?.any((g) => g != goalId) ?? false,
+    );
     if (tasks.isEmpty) {
       throw Exception('LLM returned no valid tasks');
     }
@@ -575,6 +589,64 @@ Return only JSON matching the required schema.
     await db.updateTask(task.copyWith(status: TaskStatus.completed));
   }
 
+  /// Un-complete a task: set pending again. Explicit user undo is the one
+  /// exception to monotonic completion — re-plan/skip still never touch a
+  /// completed task. Re-slots into free time like skipTask, without the
+  /// skip-count bump; a user-pinned schedule is kept as-is (the pin rule
+  /// outranks the undo). The old calendar event is deleted and a new one
+  /// written at the new placement.
+  Future<PlacementResult> uncompleteTask(String taskId) async {
+    final task = await db.getTask(taskId);
+    if (task == null) throw Exception('Task not found: $taskId');
+    // Idempotent like completeTask: only a completed task can be undone.
+    if (task.status != TaskStatus.completed) return PlacementResult(task);
+
+    if (task.userEdited && task.scheduledStart != null) {
+      // Deliberately moved in an external calendar: keep the pinned slot,
+      // just flip the status.
+      final uncompleted = task.copyWith(status: TaskStatus.pending);
+      await db.updateTask(uncompleted);
+      return PlacementResult(uncompleted);
+    }
+
+    final now = DateTime.now();
+    final horizonStart = DateTime(now.year, now.month, now.day);
+    final busyBlocks = await db.getBusyBlocksInRange(
+      horizonStart,
+      horizonStart.add(Duration(days: horizonDays)),
+    );
+    final allTasks = await db.getAllTasks();
+
+    final result = slotter.reSlotSkippedTask(
+      task: task,
+      busyBlocks: busyBlocks,
+      currentTasks: allTasks,
+      horizonStart: horizonStart,
+      horizonDays: horizonDays,
+    );
+    // reSlotSkippedTask bumps skipCount and sets pending; keep the original
+    // count so an un-completed task keeps its skip history clean.
+    final uncompleted = result.task.copyWith(skipCount: task.skipCount);
+    await db.updateTask(uncompleted);
+
+    if (calendar != null) {
+      if (task.deviceEventId != null) {
+        try {
+          await calendar!.deleteEvent(task.deviceEventId!);
+        } catch (_) {}
+      }
+      if (uncompleted.scheduledStart != null &&
+          uncompleted.scheduledEnd != null) {
+        try {
+          final newId = await calendar!.writeTaskEvent(uncompleted);
+          await db.updateTask(uncompleted.copyWith(deviceEventId: newId));
+        } catch (_) {}
+      }
+    }
+
+    return PlacementResult(uncompleted);
+  }
+
   /// Import a .ics file: parse events to busy blocks, replace (not duplicate)
   /// any previously imported blocks from the same source. Callable from the
   /// Settings ".ics import" action (SPEC 7.2 / 8). Returns imported block count.
@@ -592,13 +664,19 @@ Return only JSON matching the required schema.
     return blocks.length;
   }
 
+  static String _titleKey(String title) =>
+      title.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
   /// Validate and convert raw LLM task list to domain Tasks.
   /// Enforces: horizon bounds, known goal_ids, prerequisite graph integrity.
+  /// Rows matching [isCopy] are dropped before id mapping, so prerequisite
+  /// references to them are discarded like any unknown id.
   List<Task> _validateAndConvertTasks(
     List<dynamic> rawTasks,
     List<Goal> goals, {
     Map<String, String?> pinnedDeadlines = const {},
     Set<String> preserveIds = const {},
+    bool Function(String goalId, String title)? isCopy,
   }) {
     final goalsById = {for (final g in goals) g.id: g};
     final now = DateTime.now();
@@ -622,6 +700,7 @@ Return only JSON matching the required schema.
             .toList();
 
         if (!goalsById.containsKey(goalId)) continue;
+        if (isCopy != null && isCopy(goalId, title)) continue;
         if (duration < 5 || duration > 480) continue;
 
         final dayDate = DateTime.tryParse(recommendedDay);

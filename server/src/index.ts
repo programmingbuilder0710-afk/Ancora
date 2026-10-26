@@ -32,7 +32,9 @@ async function pd(env: ServerEnv, path: string, method = 'GET', body?: Json, hea
   return response.status === 204 ? {} : response.json();
 }
 async function accounts(env: ServerEnv, user: string): Promise<Account[]> {
-  const data = await pd(env, `users/${encodeURIComponent(user)}/accounts?include_credentials=false`);
+  // Pipedream 404s the per-user endpoint until the external user connects their first account.
+  const data = await pd(env, `users/${encodeURIComponent(user)}/accounts?include_credentials=false`)
+    .catch(e => { if (e instanceof ApiError && e.status === 404) return []; throw e; });
   return (Array.isArray(data) ? data : data.data ?? []).filter((a: any) => apps.includes(a.app?.name_slug))
     .map((a: any) => ({ id: a.id, app: a.app.name_slug, name: a.name ?? a.email ?? a.app.name }));
 }
@@ -122,7 +124,7 @@ async function route(request: Request, env: ServerEnv): Promise<Response> {
     }
     return json({ blocks, errors });
   }
-  if (request.method === 'POST' && url.pathname === '/api/events') {
+  if (request.method === 'POST' && url.pathname === '/api/plan-writes') {
     if (typeof body.account_id !== 'string' || !Array.isArray(body.delete) || !body.delete.every((id: unknown) => typeof id === 'string' && id.length > 0) ||
       !Array.isArray(body.create) || !body.create.every((e: any) => e && typeof e.key === 'string' && typeof e.title === 'string' && utc(e.start) && utc(e.end) && Date.parse(e.end) > Date.parse(e.start))) throw new ApiError(400, 'Invalid events');
     const account = (await accounts(env, user)).find(a => a.id === body.account_id);

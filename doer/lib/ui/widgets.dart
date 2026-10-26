@@ -3,6 +3,17 @@ import 'package:intl/intl.dart';
 
 import '../models/models.dart';
 
+/// Human-readable label for a busy-block source: `ics:<host>`,
+/// `pd:<app>:<account name>`, or an imported file name.
+String busySourceName(String source) {
+  if (source.startsWith('ics:')) return source.substring(4);
+  if (!source.startsWith('pd:')) return source;
+  final parts = source.split(':');
+  if (parts.length < 3) return source;
+  final id = parts.skip(2).join(':');
+  return '$id · ${parts[1] == 'google_calendar' ? 'Google Calendar' : 'Outlook'}';
+}
+
 class PriorityBadge extends StatelessWidget {
   final GoalPriority priority;
   final bool compact;

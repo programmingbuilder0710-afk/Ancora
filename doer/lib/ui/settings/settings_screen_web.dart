@@ -282,15 +282,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await _run(_reload);
   }
 
-  String _sourceName(String source) {
-    if (source.startsWith('ics:')) return source.substring(4);
-    if (!source.startsWith('pd:')) return source;
-    final parts = source.split(':');
-    if (parts.length < 3) return source;
-    final id = parts.skip(2).join(':');
-    return '$id · ${parts[1] == 'google_calendar' ? 'Google Calendar' : 'Outlook'}';
-  }
-
   Widget _accountTile(CalendarAccount account) => ListTile(
     leading: CircleAvatar(
       child: Text(account.app == 'google_calendar' ? 'G' : 'O'),
@@ -307,6 +298,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           await widget.services.connected!.setPlanAccountId(
             _planAccount == account.id ? null : account.id,
           );
+          await widget.services.projectPlan();
         } else {
           if (!await confirmAction(context, 'Disconnect ${account.name}?')) {
             return;
@@ -353,7 +345,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   leading: CircleAvatar(
                     backgroundColor: theme.colorScheme.secondaryContainer,
                     child: Icon(
-                      Icons.auto_awesome,
+                      Icons.settings,
                       color: theme.colorScheme.onSecondaryContainer,
                     ),
                   ),
@@ -477,6 +469,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ),
                   for (final account in _accounts) _accountTile(account),
+                  if (_accounts.isNotEmpty &&
+                      !_accounts.any((a) => a.id == _planAccount))
+                    ListTile(
+                      leading: const Icon(Icons.info_outline),
+                      title: Text(
+                        'Your plan is not written to a calendar yet. Open ⋮ on an account and choose "Write my plan here".',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ),
                   ListTile(
                     leading: const Icon(Icons.add_link),
                     title: const Text('Connect a calendar'),
@@ -534,7 +535,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 for (final source in _sources.entries)
                   ListTile(
-                    title: Text(_sourceName(source.key)),
+                    title: Text(busySourceName(source.key)),
                     subtitle: Text('${source.value} busy periods'),
                     trailing: IconButton(
                       tooltip: 'Remove',

@@ -65,6 +65,24 @@ it('writes My Plan events best effort and ignores missing deletes', async () => 
   expect(result.created).toEqual({ ok: 'created' }); expect(result.errors).toHaveLength(2);
   expect(proxy.mock.calls[4][2].description).toBe('Planned by Doer');
 });
+it('writes Google plans to primary as free time when My Plan cannot be created', async () => {
+  const proxy = vi.fn().mockResolvedValueOnce({ items: [{ id: 'shared', summary: 'My Plan', accessRole: 'reader' }] })
+    .mockRejectedValueOnce({ status: 403 }).mockResolvedValueOnce({ id: 'created' });
+  const result = await writeEvents(proxy as Proxy, { id: 'a', app: 'google_calendar', name: 'Me' }, [],
+    [{ key: 'ok', title: 'Task', start, end }]);
+  expect(result).toEqual({ created: { ok: 'created' }, errors: [] });
+  expect(proxy.mock.calls[2][0]).toBe('https://www.googleapis.com/calendar/v3/calendars/primary/events');
+  expect(proxy.mock.calls[2][2].transparency).toBe('transparent');
+});
+it('keeps writable My Plan events opaque and surfaces other creation failures', async () => {
+  const writable = vi.fn().mockResolvedValueOnce({ items: [{ id: 'mine', summary: 'My Plan', accessRole: 'owner' }] })
+    .mockResolvedValueOnce({ id: 'created' });
+  await writeEvents(writable as Proxy, { id: 'a', app: 'google_calendar', name: 'Me' }, [], [{ key: 'ok', title: 'Task', start, end }]);
+  expect(writable.mock.calls[1][0]).toContain('/calendars/mine/events');
+  expect(writable.mock.calls[1][2].transparency).toBeUndefined();
+  const failing = vi.fn().mockResolvedValueOnce({ items: [] }).mockRejectedValueOnce({ status: 503 });
+  await expect(writeEvents(failing as Proxy, { id: 'a', app: 'google_calendar', name: 'Me' }, [], [])).rejects.toEqual({ status: 503 });
+});
 it('rejects private ICS hosts, redirects and non-calendar responses', async () => {
   for (const host of ['localhost', '127.0.0.1', '10.0.0.1', '192.168.0.1', '172.16.0.1', '169.254.1.1', '[::1]', 'calendar.local', '2130706433']) {
     expect(() => icsUrl(`https://${host}/calendar`)).toThrow();
@@ -102,6 +120,18 @@ it('returns successful busy accounts when another account fails and forwards pro
   expect(data.blocks).toHaveLength(1);
   expect(data.blocks[0].source).toBe('pd:google_calendar:Work');
   expect(data.errors).toEqual([{ account: 'bad', message: 'Could not sync Other' }]);
+});
+it('treats a user Pipedream has not seen yet as having no accounts', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (input: string) => input.endsWith('/oauth/token')
+    ? Response.json({ access_token: 'new-user-token', expires_in: 3600 })
+    : Response.json({ error: 'not found' }, { status: 404 })));
+  const e = { ...env, PIPEDREAM_CLIENT_ID: 'new-user-test' };
+  const accounts = await worker.fetch(new Request(`http://localhost:8787/api/accounts?user=${user}`), e);
+  expect(accounts.status).toBe(200);
+  expect(await accounts.json()).toEqual([]);
+  const busy = await worker.fetch(request('busy', { user, start, end }), e);
+  expect(busy.status).toBe(200);
+  expect(await busy.json()).toEqual({ blocks: [], errors: [] });
 });
 it('caps streamed ICS responses at 5 MB', async () => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array(5 * 1024 * 1024 + 1))));

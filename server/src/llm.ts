@@ -39,7 +39,7 @@ export async function demoCompletion(request: Request, env: ServerEnv): Promise<
       method: 'POST', signal: AbortSignal.timeout(90000),
       headers: { Authorization: `Bearer ${env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages: body.messages, response_format: body.response_format,
-        temperature: body.temperature, model: env.DEMO_MODEL || 'qwen/qwen3.8-27b:free',
+        temperature: body.temperature, model: env.DEMO_MODEL || 'xingchen-agi/xing4.0-29b-a4b:free',
         max_tokens: typeof body.max_tokens === 'number' && Number.isFinite(body.max_tokens)
           ? Math.max(1, Math.min(4000, Math.floor(body.max_tokens))) : 4000 }),
     });

@@ -46,6 +46,14 @@ URL-safe-base64 API proxy with `x-pd-proxy-` headers. `/api/ics` also requires t
 UUID `user` query parameter, like every data route. No UUIDs, subscription URLs,
 or upstream response bodies are logged. Treat the locally stored UUID as a
 bearer secret; clearing browser storage loses access to that install's connections.
+Pipedream's managed Google OAuth client grants `calendar.events` and `calendar.readonly` but
+not calendar creation, so Google plans go to an existing writable "My Plan" calendar if the
+user has one, otherwise to the primary calendar marked as free time (transparent, so Doer's
+own sessions never come back as busy). Outlook gets a created "My Plan" calendar.
+Route note: never add a `/api/event…` path while the app is served on `workers.dev` —
+EasyPrivacy blocks that prefix for all workers.dev subdomains (uBlock default), which
+silently kills the request. Plan writes use `/api/plan-writes`; a custom domain escapes
+the whole class.
 
 Development-mode Connect requires being signed into Pipedream in the browser
 and supports at most ten external users. Real OAuth/provider tests require your

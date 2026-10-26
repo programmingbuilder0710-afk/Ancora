@@ -94,6 +94,27 @@ class _AgendaScreenState extends State<AgendaScreen> {
     DataReload.bump();
   }
 
+  Future<void> _uncompleteTask(Task task) async {
+    if (task.status != TaskStatus.completed) return;
+    try {
+      final orchestrator =
+          await widget.services.buildLocalOrchestrator(refreshBusyBlocks: true);
+      final result = await orchestrator.uncompleteTask(task.id);
+      final start = result.task.scheduledStart;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(start == null
+              ? 'Un-completed — couldn\'t fit, needs attention'
+              : 'Un-completed — moved to ${DateFormat('EEE, HH:mm').format(DateTime.parse(start).toLocal())}'),
+        ));
+      }
+    } on Exception catch (e) {
+      _showError('Could not un-complete: $e');
+      return;
+    }
+    DataReload.bump();
+  }
+
   Future<void> _skipTask(Task task) async {
     try {
       // Skipping re-slots the task now: refresh device busy blocks first.
@@ -234,6 +255,7 @@ class _AgendaScreenState extends State<AgendaScreen> {
                   goalsById: _goalsById,
                   isFirstDay: index == 0,
                   onComplete: _completeTask,
+                  onUncomplete: _uncompleteTask,
                   onSkip: _skipTask,
                 );
               },
@@ -293,6 +315,7 @@ class _DayPage extends StatelessWidget {
     required this.goalsById,
     required this.isFirstDay,
     required this.onComplete,
+    required this.onUncomplete,
     required this.onSkip,
   });
 
@@ -303,6 +326,7 @@ class _DayPage extends StatelessWidget {
   final Map<String, Goal> goalsById;
   final bool isFirstDay;
   final Future<void> Function(Task) onComplete;
+  final Future<void> Function(Task) onUncomplete;
   final Future<void> Function(Task) onSkip;
 
   @override
@@ -358,6 +382,7 @@ class _DayPage extends StatelessWidget {
             goal: goalsById[entry.key],
             tasks: entry.value,
             onComplete: onComplete,
+            onUncomplete: onUncomplete,
             onSkip: onSkip,
           ),
         if (unscheduledTasks.isNotEmpty) ...[
@@ -375,6 +400,7 @@ class _DayPage extends StatelessWidget {
             _TaskTile(
               task: task,
               onComplete: () => onComplete(task),
+              onUncomplete: () => onUncomplete(task),
               onSkip: () => onSkip(task),
             ),
         ],
@@ -435,11 +461,13 @@ class _GoalGroup extends StatelessWidget {
     required this.tasks,
     required this.onComplete,
     required this.onSkip,
+    required this.onUncomplete,
   });
 
   final Goal? goal;
   final List<Task> tasks;
   final Future<void> Function(Task) onComplete;
+  final Future<void> Function(Task) onUncomplete;
   final Future<void> Function(Task) onSkip;
 
   @override
@@ -470,6 +498,7 @@ class _GoalGroup extends StatelessWidget {
           _TaskTile(
             task: task,
             onComplete: () => onComplete(task),
+            onUncomplete: () => onUncomplete(task),
             onSkip: () => onSkip(task),
           ),
       ],
@@ -481,11 +510,13 @@ class _TaskTile extends StatelessWidget {
   const _TaskTile({
     required this.task,
     required this.onComplete,
+    required this.onUncomplete,
     required this.onSkip,
   });
 
   final Task task;
   final VoidCallback onComplete;
+  final VoidCallback onUncomplete;
   final VoidCallback onSkip;
 
   @override
@@ -555,7 +586,11 @@ class _TaskTile extends StatelessWidget {
             )
           : null,
       trailing: done
-          ? Icon(Icons.check_circle, color: colorScheme.primary)
+          ? IconButton(
+              tooltip: 'Completed — tap to undo',
+              icon: Icon(Icons.check_circle, color: colorScheme.primary),
+              onPressed: onUncomplete,
+            )
           : Row(
               mainAxisSize: MainAxisSize.min,
               children: [

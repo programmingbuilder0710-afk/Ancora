@@ -195,6 +195,94 @@ void main() {
     await helper.close();
   });
 
+  test('uncomplete: pending again, re-slotted into horizon, skip history kept', () async {
+    final helper = DatabaseHelper.forTest();
+
+    // Horizon-relative: today +2 keeps placement inside the 7-day window
+    // regardless of the clock, and avoids the 2026-09-28 fixture trap.
+    final today = DateTime.now();
+    String dayKey(DateTime d) =>
+        '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+    final future = today.add(const Duration(days: 2));
+
+    final g = Goal(
+      id: 'g-undo',
+      title: 'Learn Rust',
+      description: '',
+      priority: GoalPriority.P1,
+      targetDate: dayKey(today.add(const Duration(days: 6))),
+      createdAt: today.toIso8601String(),
+    );
+    await helper.insertGoal(g);
+
+    final done = Task(
+      id: 't-done',
+      goalId: 'g-undo',
+      title: 'Completed task',
+      durationMinutes: 60,
+      recommendedDay: dayKey(future),
+      scheduledStart: '${dayKey(future)}T09:00:00.000',
+      scheduledEnd: '${dayKey(future)}T10:00:00.000',
+      status: TaskStatus.completed,
+      createdAt: today.toIso8601String(),
+    );
+    await helper.insertTask(done);
+
+    final prefs = await _prefsOrDefault(helper);
+    final slotter = Slotter(prefs)..allGoals = {'g-undo': g};
+    final provider = FakeProvider(const {});
+    final orchestrator = Orchestrator(
+      db: helper,
+      providerFactory: () => provider,
+      slotter: slotter,
+    );
+
+    final result = await orchestrator.uncompleteTask('t-done');
+    expect(result.task.status, TaskStatus.pending);
+    expect(result.task.scheduledStart, isNotNull);
+    expect(result.task.skipCount, 0, reason: 'undo must not bump skipCount');
+    expect(
+      DateTime.parse(result.task.scheduledStart!)
+          .isAfter(today.subtract(const Duration(days: 1))),
+      isTrue,
+      reason: 're-slot must land inside the horizon',
+    );
+
+    final persisted = await helper.getTask('t-done');
+    expect(persisted!.status, TaskStatus.pending);
+    expect(persisted.skipCount, 0);
+
+    // Non-completed input is a silent no-op (idempotent, like completeTask).
+    final noop = await orchestrator.uncompleteTask('t-done');
+    expect(noop.task.status, TaskStatus.pending);
+
+    // A user-pinned completed task keeps its slot on undo: only status flips.
+    final pinned = Task(
+      id: 't-pinned',
+      goalId: 'g-undo',
+      title: 'Pinned task',
+      durationMinutes: 60,
+      recommendedDay: dayKey(future),
+      scheduledStart: '${dayKey(future)}T15:30:00.000',
+      scheduledEnd: '${dayKey(future)}T16:30:00.000',
+      status: TaskStatus.completed,
+      userEdited: true,
+      createdAt: today.toIso8601String(),
+    );
+    await helper.insertTask(pinned);
+    final pinnedResult = await orchestrator.uncompleteTask('t-pinned');
+    expect(pinnedResult.task.status, TaskStatus.pending);
+    expect(pinnedResult.task.scheduledStart, '${dayKey(future)}T15:30:00.000',
+        reason: 'pin survives undo');
+
+    // Monotonic guard still holds for unknown ids.
+    await expectLater(
+      orchestrator.uncompleteTask('no-such-task'),
+      throwsException,
+    );
+    await helper.close();
+  });
+
   test('replan: user-edited schedule is pinned - never re-cleared, re-slotted, or rewritten', () async {
     final helper = DatabaseHelper.forTest();
     // Goal with a horizon-safe target date: the shared goal() helper pins
@@ -323,6 +411,101 @@ void main() {
     );
     // Schema violation + exactly one repair retry = 2 calls.
     expect(badProvider.calls, 2);
+
+    await helper.close();
+  });
+
+  test('decompose: second goal never inherits another goal\'s task titles', () async {
+    final helper = DatabaseHelper.forTest();
+    final today = DateTime.now();
+    String dayKey(DateTime d) =>
+        '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+    final day1 = dayKey(today.add(const Duration(days: 1)));
+    Goal horizonGoal(String id, String title) => Goal(
+          id: id,
+          title: title,
+          priority: GoalPriority.P2,
+          targetDate: dayKey(today.add(const Duration(days: 6))),
+          createdAt: today.toIso8601String(),
+        );
+    final book = horizonGoal('g-book', 'Read one book');
+    final pasta = horizonGoal('g-pasta', 'Learn to cook pasta');
+    await helper.insertGoal(book);
+    await helper.insertGoal(pasta);
+    await helper.insertTasks([
+      Task(
+        id: 't-book',
+        goalId: 'g-book',
+        title: 'Select and acquire book',
+        durationMinutes: 60,
+        recommendedDay: day1,
+        scheduledStart: '${day1}T09:00:00.000',
+        scheduledEnd: '${day1}T10:00:00.000',
+        createdAt: today.toIso8601String(),
+      ),
+    ]);
+
+    // The model echoes the first goal's task (case/spacing changed) under
+    // the new goal's id, and chains a real task onto the copy.
+    final provider = FakeProvider({
+      'tasks': [
+        {
+          'task_id': 'copy',
+          'goal_id': 'g-pasta',
+          'title': '  select and  ACQUIRE book ',
+          'duration_minutes': 60,
+          'recommended_day': day1,
+          'prerequisite_ids': [],
+        },
+        {
+          'task_id': 'real',
+          'goal_id': 'g-pasta',
+          'title': 'Boil water and cook spaghetti',
+          'duration_minutes': 45,
+          'recommended_day': day1,
+          'prerequisite_ids': ['copy'],
+        },
+      ],
+    });
+    final orchestrator = Orchestrator(
+      db: helper,
+      providerFactory: () => provider,
+      slotter: Slotter(await _prefsOrDefault(helper))
+        ..allGoals = {book.id: book, pasta.id: pasta},
+    );
+
+    await orchestrator.decompose(goals: [pasta]);
+
+    final pastaTasks = await helper.getTasksByGoal('g-pasta');
+    expect(pastaTasks.map((t) => t.title), ['Boil water and cook spaghetti']);
+    expect(pastaTasks.single.prerequisiteIds, isEmpty);
+    expect(
+      (await helper.getTasksByGoal('g-book')).map((t) => t.title),
+      ['Select and acquire book'],
+    );
+
+    // A response that is nothing but copies leaves no valid task.
+    final copiesOnly = Orchestrator(
+      db: helper,
+      providerFactory: () => FakeProvider({
+        'tasks': [
+          {
+            'task_id': 'copy',
+            'goal_id': 'g-pasta',
+            'title': 'Select and acquire book',
+            'duration_minutes': 60,
+            'recommended_day': day1,
+            'prerequisite_ids': [],
+          },
+        ],
+      }),
+      slotter: orchestrator.slotter,
+    );
+    await expectLater(
+      copiesOnly.decompose(goals: [pasta]),
+      throwsA(isA<Exception>()),
+    );
+    expect((await helper.getTasksByGoal('g-pasta')).length, 1);
 
     await helper.close();
   });
